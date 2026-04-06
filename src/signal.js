@@ -1,13 +1,6 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
 import { getCandles } from './candles.js';
-import {
-  CURRENCY,
-  KELLY_FRACTION,
-  MAX_STAKE_NGN,
-  MIN_STAKE_NGN,
-} from './config.js';
-
-const QUOTE_FEE_PROBE_AMOUNT = 100;
+import { CURRENCY, KELLY_FRACTION, MAX_STAKE_NGN, MIN_STAKE_NGN } from './config.js';
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -71,36 +64,14 @@ function macd(closes) {
   };
 }
 
-function computeDelta5m(priceHistory) {
-  if (priceHistory.length < 2) return 0;
-
-  const latest = priceHistory.at(-1);
-  const latestTs = new Date(latest.timestamp).getTime();
-  if (!Number.isFinite(latestTs)) return 0;
-
-  const targetTs = latestTs - 5 * 60 * 1000;
-  let baseline = null;
-
-  for (let i = priceHistory.length - 2; i >= 0; i -= 1) {
-    const tick = priceHistory[i];
-    const tickTs = new Date(tick.timestamp).getTime();
-    if (!Number.isFinite(tickTs)) continue;
-
-    if (tickTs <= targetTs) {
-      baseline = tick;
-      break;
-    }
-  }
-
-  if (!baseline || !baseline.price) return 0;
-  return ((latest.price - baseline.price) / baseline.price) * 100;
-}
-
 function computeMomentum(priceHistory, candles) {
   const closes = candles.map((c) => c.close);
   const rsi = rsiWilder(closes, 14);
   const macdValues = macd(closes);
-  const delta5m = computeDelta5m(priceHistory);
+
+  const latest = priceHistory.at(-1)?.price;
+  const from5 = priceHistory.at(-6)?.price;
+  const delta5m = latest && from5 ? ((latest - from5) / from5) * 100 : 0;
 
   const rsiScore = rsi == null ? 0 : rsi > 55 ? 1 : rsi < 45 ? -1 : 0;
   const macdScore =
@@ -129,14 +100,9 @@ function computeVolumeScore(candles, momentumScore) {
   return clamp(trend * directional, -1, 1);
 }
 
-async function fetchQuoteFeeRatio(eventId, marketId) {
+async function fetchQuoteFee(eventId, marketId) {
   const path = `/v1/pm/events/${eventId}/markets/${marketId}/quote`;
-  const bodyObj = {
-    side: 'BUY',
-    outcome: 'YES',
-    amount: QUOTE_FEE_PROBE_AMOUNT,
-    currency: CURRENCY,
-  };
+  const bodyObj = { side: 'BUY', outcome: 'YES', amount: 100, currency: CURRENCY };
   const body = JSON.stringify(bodyObj);
 
   const response = await fetch(`${BASE_URL}${path}`, {
@@ -151,36 +117,16 @@ async function fetchQuoteFeeRatio(eventId, marketId) {
   }
 
   const data = await response.json();
-
-  const feeAmount = Number(data.fee ?? data.quote?.fee ?? data.fees?.total ?? 0);
-  const feeRate = Number(data.feeRate ?? data.quote?.feeRate ?? data.fees?.rate ?? Number.NaN);
-
-  if (Number.isFinite(feeRate) && feeRate >= 0) {
-    return feeRate > 1 ? feeRate / 100 : feeRate;
-  }
-
-  if (feeAmount <= 0) return 0;
-
-  // Convert absolute fee paid for probe amount into a probability/edge-equivalent ratio.
-  return feeAmount / QUOTE_FEE_PROBE_AMOUNT;
+  return Number(data.fee ?? data.quote?.fee ?? 0);
 }
 
 export async function generateSignal(state) {
-  const yesPrice = Number(state.yesPrice);
-  const marketImpliedP = clamp(yesPrice, 0, 1);
+  const pUp = 1 - Number(state.yesPrice);
+  const rawEdge = pUp - Number(state.yesPrice);
 
-  const candles = getCandles(state.priceHistory);
-  const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
-  const volumeScore = computeVolumeScore(candles, momentumScore);
-
-  const modelP = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
-  const pUp = clamp(modelP * 0.7 + marketImpliedP * 0.3, 0, 1);
-
-  const rawEdge = pUp - yesPrice;
-
-  let feeRatio;
+  let fee;
   try {
-    feeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId);
+    fee = await fetchQuoteFee(state.eventId, state.marketId);
   } catch (error) {
     return {
       shouldTrade: false,
@@ -190,49 +136,43 @@ export async function generateSignal(state) {
       confidence: 0,
       stake: 0,
       reason: `Could not fetch quote fee: ${error.message}`,
-      delta5m,
+      delta5m: 0,
     };
   }
 
-  const netEdge = rawEdge - feeRatio;
+  const netEdge = rawEdge - fee / 100;
+
+  const candles = getCandles(state.priceHistory);
+  const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
+  const volumeScore = computeVolumeScore(candles, momentumScore);
   const oddsDivergence = clamp(netEdge, -1, 1);
 
   const compositeScore =
     oddsDivergence * 0.4 + momentumScore * 0.35 + volumeScore * 0.25;
 
-  let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
+  let threshold = state.yesPrice >= 0.4 && state.yesPrice <= 0.6 ? 0.65 : 0.55;
   if (Math.abs(delta5m) > 0.5) {
     threshold -= 0.05;
   }
 
-  const direction = pUp >= 0.5 ? 'YES' : 'NO';
-  const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
-  const directionalEdge =
-    direction === 'YES' ? netEdge : -(pUp - yesPrice) - feeRatio;
-
-  const kelly = pricedSide > 0 ? directionalEdge / pricedSide : 0;
+  const kelly = state.yesPrice > 0 ? netEdge / state.yesPrice : 0;
   const rawStake = kelly * state.balance * KELLY_FRACTION;
-  const maxAffordableStake = Math.min(MAX_STAKE_NGN, state.balance);
-  const hasMinimumBalanceForStake = maxAffordableStake >= MIN_STAKE_NGN;
-  const stake = hasMinimumBalanceForStake
-    ? clamp(rawStake, MIN_STAKE_NGN, maxAffordableStake)
-    : 0;
+  const stake = clamp(rawStake, MIN_STAKE_NGN, MAX_STAKE_NGN);
 
-  const shouldTrade =
-    compositeScore > threshold && directionalEdge > 0 && hasMinimumBalanceForStake;
+const direction = momentumScore >= 0 ? 'YES' : 'NO';
+const directionalEdge = direction === 'YES' ? netEdge : -(pUp - Number(state.yesPrice)) - (fee / 100);
+const shouldTrade = compositeScore > threshold && directionalEdge > 0;
 
   return {
     shouldTrade,
     direction: shouldTrade ? direction : null,
     pUp,
-    netEdge: directionalEdge,
+    netEdge,
     confidence: compositeScore,
     stake: Number(stake.toFixed(2)),
     reason: shouldTrade
       ? 'Composite signal crossed dynamic threshold'
-      : hasMinimumBalanceForStake
-        ? `Composite score ${compositeScore.toFixed(3)} did not beat threshold ${threshold.toFixed(3)} or edge <= 0`
-        : `Insufficient balance for minimum stake (${MIN_STAKE_NGN} ${CURRENCY})`,
+      : `Composite score ${compositeScore.toFixed(3)} did not beat threshold ${threshold.toFixed(3)}`,
     delta5m,
   };
 }
