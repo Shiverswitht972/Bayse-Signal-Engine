@@ -1,11 +1,6 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
-import { getCandles } from './candles.js';
-import {
-  CURRENCY,
-  KELLY_FRACTION,
-  MAX_STAKE_NGN,
-  MIN_STAKE_NGN,
-} from './config.js';
+  getCandles,
+} from './agent.js';
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -126,17 +121,8 @@ async function fetchQuoteFee(eventId, marketId) {
 }
 
 export async function generateSignal(state) {
-  const yesPrice = Number(state.yesPrice);
-  const marketImpliedP = clamp(yesPrice, 0, 1);
-
-  const candles = getCandles(state.priceHistory);
-  const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
-  const volumeScore = computeVolumeScore(candles, momentumScore);
-
-  const modelP = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
-  const pUp = clamp(modelP * 0.7 + marketImpliedP * 0.3, 0, 1);
-
-  const rawEdge = pUp - yesPrice;
+  const pUp = 1 - Number(state.yesPrice);
+  const rawEdge = pUp - Number(state.yesPrice);
 
   let fee;
   try {
@@ -150,41 +136,41 @@ export async function generateSignal(state) {
       confidence: 0,
       stake: 0,
       reason: `Could not fetch quote fee: ${error.message}`,
-      delta5m,
+      delta5m: 0,
     };
   }
 
   const netEdge = rawEdge - fee / 100;
+
+  const candles = getCandles(state.priceHistory);
+  const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
+  const volumeScore = computeVolumeScore(candles, momentumScore);
   const oddsDivergence = clamp(netEdge, -1, 1);
 
   const compositeScore =
     oddsDivergence * 0.4 + momentumScore * 0.35 + volumeScore * 0.25;
 
-  let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
+  let threshold = state.yesPrice >= 0.4 && state.yesPrice <= 0.6 ? 0.65 : 0.55;
   if (Math.abs(delta5m) > 0.5) {
     threshold -= 0.05;
   }
 
-  const direction = pUp >= 0.5 ? 'YES' : 'NO';
-  const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
-  const directionalEdge = direction === 'YES' ? netEdge : -netEdge;
-
-  const kelly = pricedSide > 0 ? directionalEdge / pricedSide : 0;
+  const kelly = state.yesPrice > 0 ? netEdge / state.yesPrice : 0;
   const rawStake = kelly * state.balance * KELLY_FRACTION;
   const stake = clamp(rawStake, MIN_STAKE_NGN, MAX_STAKE_NGN);
 
-  const shouldTrade = compositeScore > threshold && directionalEdge > 0;
+  const shouldTrade = compositeScore > threshold && netEdge > 0;
 
   return {
     shouldTrade,
-    direction: shouldTrade ? direction : null,
+    direction: shouldTrade ? (momentumScore >= 0 ? 'YES' : 'NO') : null,
     pUp,
-    netEdge: directionalEdge,
+    netEdge,
     confidence: compositeScore,
     stake: Number(stake.toFixed(2)),
     reason: shouldTrade
       ? 'Composite signal crossed dynamic threshold'
-      : `Composite score ${compositeScore.toFixed(3)} did not beat threshold ${threshold.toFixed(3)} or edge <= 0`,
+      : `Composite score ${compositeScore.toFixed(3)} did not beat threshold ${threshold.toFixed(3)}`,
     delta5m,
   };
 }

@@ -3,16 +3,19 @@ import { BASE_URL, buildReadHeaders } from './auth.js';
 import { generateSignal } from './signal.js';
 import { executeOrder } from './executor.js';
 import { sendNotification } from './notify.js';
-import {
-  BALANCE_REFRESH_MS,
-  CURRENCY,
-  DAILY_LOSS_FLOOR,
-  MARKET_END_BUFFER_MINUTES,
-  MIN_HISTORY_POINTS,
-  MINUTES_BETWEEN_TRADES,
-  WS_BACKOFF_MAX_MS,
-  WS_BACKOFF_START_MS,
-} from './config.js';
+
+export const MAX_STAKE_NGN = 6500;
+export const DAILY_LOSS_FLOOR = 500;
+export const KELLY_FRACTION = 0.5;
+export const MIN_STAKE_NGN = 150;
+export const CURRENCY = 'NGN';
+
+const MIN_HISTORY_POINTS = 6;
+const MINUTES_BETWEEN_TRADES = 15;
+const MARKET_END_BUFFER_MINUTES = 3;
+const BALANCE_REFRESH_MS = 5 * 60 * 1000;
+const WS_BACKOFF_START_MS = 2_000;
+const WS_BACKOFF_MAX_MS = 30_000;
 
 const state = {
   btcPrice: null,
@@ -29,7 +32,39 @@ const state = {
   dailyPnLResetDate: null,
 };
 
-export { getCandles } from './candles.js';
+export function getCandles(priceHistory, intervalMinutes = 1) {
+  const bucketMs = intervalMinutes * 60 * 1000;
+  const byBucket = new Map();
+
+  for (const tick of priceHistory) {
+    const ts = new Date(tick.timestamp).getTime();
+    if (!Number.isFinite(ts)) continue;
+
+    const bucket = Math.floor(ts / bucketMs) * bucketMs;
+    const candle = byBucket.get(bucket);
+
+    if (!candle) {
+      byBucket.set(bucket, {
+        timestamp: new Date(bucket).toISOString(),
+        open: tick.price,
+        high: tick.price,
+        low: tick.price,
+        close: tick.price,
+        volume: tick.volume ?? 1,
+      });
+      continue;
+    }
+
+    candle.high = Math.max(candle.high, tick.price);
+    candle.low = Math.min(candle.low, tick.price);
+    candle.close = tick.price;
+    candle.volume += tick.volume ?? 1;
+  }
+
+  return [...byBucket.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, candle]) => candle);
+}
 
 function resetDailyPnlIfNeeded() {
   const utcDate = new Date().toISOString().slice(0, 10);
@@ -133,7 +168,6 @@ async function refreshEventContext() {
 async function refreshBalance() {
   try {
     const data = await fetchJson('/v1/pm/portfolio');
-    console.log('[debug] portfolio response:', JSON.stringify(data));
     const extracted = data?.balances?.NGN ?? data?.wallet?.NGN ?? data?.balance ?? null;
     const numericBalance = Number(extracted);
 
@@ -184,7 +218,6 @@ function addPriceTick(tick) {
 
 function updateOdds(payload) {
   const data = payload?.data ?? payload;
-  if (!data || typeof data !== "object") return;
 
   const yes = Number(data.yesPrice ?? data.yes ?? data.prices?.yes);
   const no = Number(data.noPrice ?? data.no ?? data.prices?.no);
@@ -279,9 +312,6 @@ export async function startAgent() {
       }));
     },
     onMessage: async (message) => {
-      if (message.type && !['price', 'prices', 'update'].includes(message.type)) {
-        return;
-      }
       updateOdds(message);
     },
   });
