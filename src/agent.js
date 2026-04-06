@@ -168,6 +168,7 @@ async function refreshEventContext() {
 async function refreshBalance() {
   try {
     const data = await fetchJson('/v1/pm/portfolio');
+    console.log('[debug] portfolio response:', JSON.stringify(data));
     const extracted = data?.balances?.NGN ?? data?.wallet?.NGN ?? data?.balance ?? null;
     const numericBalance = Number(extracted);
 
