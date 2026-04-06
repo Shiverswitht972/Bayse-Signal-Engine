@@ -217,17 +217,23 @@ function addPriceTick(tick) {
 }
 
 function updateOdds(payload) {
-  const data = payload?.data ?? payload;
+  if (payload.type !== 'price_update') return;
 
-  const yes = Number(data.yesPrice ?? data.yes ?? data.prices?.yes);
-  const no = Number(data.noPrice ?? data.no ?? data.prices?.no);
+  const markets = payload?.data?.markets ?? [];
+  const market = markets.find(m => m.id === state.marketId) ?? markets[0];
+  if (!market) return;
+
+  const prices = market.prices ?? {};
+  const yes = Number(prices.YES ?? prices.yes);
+  const no = Number(prices.NO ?? prices.no);
 
   if (Number.isFinite(yes)) state.yesPrice = yes;
   if (Number.isFinite(no)) state.noPrice = no;
 
-  if (data.eventId) state.eventId = data.eventId;
-  if (data.marketId) state.marketId = data.marketId;
-  if (data.resolvesAt) state.resolvesAt = data.resolvesAt;
+  if (payload.data?.id) state.eventId = payload.data.id;
+  if (market.id) state.marketId = market.id;
+
+  console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice}`);
 }
 
 function createReconnectableWs(name, url, handlers) {
