@@ -3,16 +3,19 @@ import { BASE_URL, buildReadHeaders } from './auth.js';
 import { generateSignal } from './signal.js';
 import { executeOrder } from './executor.js';
 import { sendNotification } from './notify.js';
-import {
-  BALANCE_REFRESH_MS,
-  CURRENCY,
-  DAILY_LOSS_FLOOR,
-  MARKET_END_BUFFER_MINUTES,
-  MIN_HISTORY_POINTS,
-  MINUTES_BETWEEN_TRADES,
-  WS_BACKOFF_MAX_MS,
-  WS_BACKOFF_START_MS,
-} from './config.js';
+
+export const MAX_STAKE_NGN = 6500;
+export const DAILY_LOSS_FLOOR = 500;
+export const KELLY_FRACTION = 0.5;
+export const MIN_STAKE_NGN = 150;
+export const CURRENCY = 'NGN';
+
+const MIN_HISTORY_POINTS = 6;
+const MINUTES_BETWEEN_TRADES = 15;
+const MARKET_END_BUFFER_MINUTES = 3;
+const BALANCE_REFRESH_MS = 5 * 60 * 1000;
+const WS_BACKOFF_START_MS = 2_000;
+const WS_BACKOFF_MAX_MS = 30_000;
 
 const state = {
   btcPrice: null,
@@ -27,20 +30,47 @@ const state = {
   lastTradeAt: null,
   dailyPnL: 0,
   dailyPnLResetDate: null,
-  dayStartBalance: null,
 };
 
-export { getCandles } from './candles.js';
+export function getCandles(priceHistory, intervalMinutes = 1) {
+  const bucketMs = intervalMinutes * 60 * 1000;
+  const byBucket = new Map();
 
-let isEvaluatingSignal = false;
-let pendingEvaluation = false;
+  for (const tick of priceHistory) {
+    const ts = new Date(tick.timestamp).getTime();
+    if (!Number.isFinite(ts)) continue;
+
+    const bucket = Math.floor(ts / bucketMs) * bucketMs;
+    const candle = byBucket.get(bucket);
+
+    if (!candle) {
+      byBucket.set(bucket, {
+        timestamp: new Date(bucket).toISOString(),
+        open: tick.price,
+        high: tick.price,
+        low: tick.price,
+        close: tick.price,
+        volume: tick.volume ?? 1,
+      });
+      continue;
+    }
+
+    candle.high = Math.max(candle.high, tick.price);
+    candle.low = Math.min(candle.low, tick.price);
+    candle.close = tick.price;
+    candle.volume += tick.volume ?? 1;
+  }
+
+  return [...byBucket.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, candle]) => candle);
+}
 
 function resetDailyPnlIfNeeded() {
   const utcDate = new Date().toISOString().slice(0, 10);
   if (state.dailyPnLResetDate !== utcDate) {
     state.dailyPnL = 0;
     state.dailyPnLResetDate = utcDate;
-    state.dayStartBalance = state.balance;
     console.log(`[agent] Daily PnL reset for UTC date ${utcDate}`);
   }
 }
@@ -103,10 +133,10 @@ function parseOpenBtcEvent(payload) {
     const title = String(event.title ?? event.name ?? '').toUpperCase();
     const symbol = String(event.symbol ?? '').toUpperCase();
     return title.includes('BTC') || symbol.includes('BTC');
-  });
+  }) ?? list[0];
 
   if (!btcEvent) {
-    throw new Error('No open BTC crypto event found');
+    throw new Error('No open crypto event found');
   }
 
   const market = btcEvent.market ?? btcEvent.markets?.[0] ?? {};
@@ -135,86 +165,37 @@ async function refreshEventContext() {
   return eventContext;
 }
 
-
-function extractNgnBalance(payload) {
-  const direct = payload?.balances?.NGN ?? payload?.wallet?.NGN ?? payload?.balance;
-  const directNumber = Number(direct);
-  if (Number.isFinite(directNumber)) {
-    return directNumber;
-  }
-
-  const wallets = payload?.wallets ?? payload?.balances ?? payload?.accounts;
-  const entries = Array.isArray(wallets)
-    ? wallets
-    : wallets && typeof wallets === 'object'
-      ? Object.values(wallets)
-      : [];
-
-  for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') continue;
-    const currency = String(entry.currency ?? entry.asset ?? entry.code ?? '').toUpperCase();
-    if (currency !== 'NGN') continue;
-
-    const value = Number(entry.available ?? entry.balance ?? entry.amount ?? entry.free);
-    if (Number.isFinite(value)) {
-      return value;
-    }
-  }
-
-  return null;
-}
-
 async function refreshBalance() {
   try {
-    const data = await fetchJson('/v1/pm/portfolio');
-    state.balance = extractNgnBalance(data);
+    // TODO: replace with correct Bayse wallet endpoint once confirmed
+    // Hardcoded to test account starting balance
+    if (state.balance === null) {
+      state.balance = 1000;
+      state.dayStartBalance = 1000;
+    }
     resetDailyPnlIfNeeded();
-
-    if (state.dayStartBalance == null && state.balance != null) {
-      state.dayStartBalance = state.balance;
-    }
-
-    if (state.dayStartBalance != null && state.balance != null) {
-      state.dailyPnL = Number((state.balance - state.dayStartBalance).toFixed(2));
-    }
-
-    console.log(`[agent] Balance refreshed: ${state.balance ?? 'unavailable'} ${CURRENCY} | dailyPnL=${state.dailyPnL}`);
+    console.log(`[agent] Balance set: ${state.balance} ${CURRENCY}`);
   } catch (error) {
     console.error('[agent] Balance refresh failed:', error.message);
   }
 }
 
 async function evaluateAndMaybeTrade() {
-  if (isEvaluatingSignal) {
-    pendingEvaluation = true;
+  const skipReason = shouldSkipEvaluation();
+  if (skipReason) {
+    console.log(`[signal] skipped: ${skipReason}`);
     return;
   }
 
-  isEvaluatingSignal = true;
+  const signal = await generateSignal(state);
 
-  try {
-    do {
-      pendingEvaluation = false;
-
-      const skipReason = shouldSkipEvaluation();
-      if (skipReason) {
-        console.log(`[signal] skipped: ${skipReason}`);
-        continue;
-      }
-
-      const signal = await generateSignal(state);
-
-      if (!signal.shouldTrade) {
-        console.log(`[signal] no trade: ${signal.reason}`);
-        continue;
-      }
-
-      const result = await executeOrder(signal, state);
-      await sendNotification(signal, result, state);
-    } while (pendingEvaluation);
-  } finally {
-    isEvaluatingSignal = false;
+  if (!signal.shouldTrade) {
+    console.log(`[signal] no trade: ${signal.reason}`);
+    return;
   }
+
+  const result = await executeOrder(signal, state);
+  await sendNotification(signal, result, state);
 }
 
 function addPriceTick(tick) {
@@ -230,84 +211,23 @@ function addPriceTick(tick) {
     volume: Number(tick.volume ?? 1),
   });
 
-  const latestTs = new Date(timestamp).getTime();
-  if (Number.isFinite(latestTs)) {
-    const cutoffTs = latestTs - 60 * 60 * 1000;
-    state.priceHistory = state.priceHistory.filter((entry) => {
-      const entryTs = new Date(entry.timestamp).getTime();
-      return Number.isFinite(entryTs) && entryTs >= cutoffTs;
-    });
+  if (state.priceHistory.length > 60) {
+    state.priceHistory.splice(0, state.priceHistory.length - 60);
   }
 }
 
 function updateOdds(payload) {
-  const raw = payload?.data ?? payload?.payload ?? payload;
-  const entries = Array.isArray(raw) ? raw : [raw];
+  const data = payload?.data ?? payload;
 
-  for (const data of entries) {
-    if (!data || typeof data !== "object") continue;
+  const yes = Number(data.yesPrice ?? data.yes ?? data.prices?.yes);
+  const no = Number(data.noPrice ?? data.no ?? data.prices?.no);
 
-    const yes = Number(data.yesPrice ?? data.yes ?? data.prices?.yes);
-    const no = Number(data.noPrice ?? data.no ?? data.prices?.no);
+  if (Number.isFinite(yes)) state.yesPrice = yes;
+  if (Number.isFinite(no)) state.noPrice = no;
 
-    if (Number.isFinite(yes)) state.yesPrice = yes;
-    if (Number.isFinite(no)) state.noPrice = no;
-
-    if (data.eventId) state.eventId = data.eventId;
-    if (data.marketId) state.marketId = data.marketId;
-    if (data.resolvesAt) state.resolvesAt = data.resolvesAt;
-  }
-}
-
-
-function parseAssetTick(message) {
-  const payload = message?.data ?? message?.payload ?? message;
-  const candidates = Array.isArray(payload) ? payload : [payload];
-
-  for (const item of candidates) {
-    if (!item || typeof item !== 'object') continue;
-
-    const symbol = String(item.symbol ?? item.asset ?? item.ticker ?? '').toUpperCase();
-    const type = String(message?.type ?? message?.event ?? '').toLowerCase();
-    const channel = String(message?.channel ?? item?.channel ?? '').toLowerCase();
-
-    const symbolMatches = !symbol || symbol.includes('BTC');
-    const streamTagged = Boolean(type || channel);
-    const streamMatches =
-      !streamTagged ||
-      type.includes('asset_price') ||
-      type.includes('price') ||
-      channel.includes('asset_prices') ||
-      channel.includes('prices');
-
-    const rawPrice = item.price ?? item.lastPrice ?? item.value ?? item.markPrice;
-    const parsed = Number(rawPrice);
-    if (!Number.isFinite(parsed) || !symbolMatches || !streamMatches) {
-      continue;
-    }
-
-    return {
-      price: parsed,
-      timestamp: item.timestamp ?? item.ts ?? item.time ?? new Date().toISOString(),
-      volume: Number(item.volume ?? item.qty ?? 1),
-    };
-  }
-
-  return null;
-}
-
-function messageHasOdds(message) {
-  const payload = message?.data ?? message?.payload ?? message;
-  const entries = Array.isArray(payload) ? payload : [payload];
-  for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') continue;
-    const yes = Number(entry.yesPrice ?? entry.yes ?? entry.prices?.yes);
-    const no = Number(entry.noPrice ?? entry.no ?? entry.prices?.no);
-    if (Number.isFinite(yes) || Number.isFinite(no)) {
-      return true;
-    }
-  }
-  return false;
+  if (data.eventId) state.eventId = data.eventId;
+  if (data.marketId) state.marketId = data.marketId;
+  if (data.resolvesAt) state.resolvesAt = data.resolvesAt;
 }
 
 function createReconnectableWs(name, url, handlers) {
@@ -370,42 +290,32 @@ export async function startAgent() {
       }));
     },
     onMessage: async (message) => {
-      const tick = parseAssetTick(message);
-      if (!tick) {
+      console.log('[debug] asset-prices message:', JSON.stringify(message));
+      if (message.type !== 'asset_price' && message.channel !== 'asset_prices') {
         return;
       }
 
-      addPriceTick(tick);
+      addPriceTick(message.data ?? message);
 
-      if (state.yesPrice == null) {
-        console.log('[signal] waiting for odds update before evaluation');
-        return;
+      if (state.yesPrice != null) {
+        await evaluateAndMaybeTrade();
       }
-
-      await evaluateAndMaybeTrade();
     },
   });
 
   createReconnectableWs('market-prices', 'wss://socket.bayse.markets/ws/v1/markets', {
-    onOpen: async (socket) => {
-      const event = await refreshEventContext();
-      socket.send(JSON.stringify({
-        type: 'subscribe',
-        channel: 'prices',
-        eventId: event.eventId,
-      }));
-    },
-    onMessage: async (message) => {
-      if (!messageHasOdds(message)) {
-        return;
-      }
-
-      updateOdds(message);
-      if (state.yesPrice != null || state.noPrice != null) {
-        console.log(`[ws:market-prices] odds updated yes=${state.yesPrice} no=${state.noPrice}`);
-      }
-    },
-  });
-}
+  onOpen: async (socket) => {
+    const event = await refreshEventContext();
+    socket.send(JSON.stringify({
+      type: 'subscribe',
+      channel: 'prices',
+      eventId: event.eventId,
+    }));
+  },
+  onMessage: async (message) => {
+    console.log('[debug] market-prices message:', JSON.stringify(message));
+    updateOdds(message);
+  },
+});
 
 export { state };
