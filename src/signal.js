@@ -1,6 +1,6 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
-  getCandles,
-} from './agent.js';
+import { getCandles } from './candles.js';
+import { CURRENCY, KELLY_FRACTION, MAX_STAKE_NGN, MIN_STAKE_NGN } from './config.js';
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -159,11 +159,13 @@ export async function generateSignal(state) {
   const rawStake = kelly * state.balance * KELLY_FRACTION;
   const stake = clamp(rawStake, MIN_STAKE_NGN, MAX_STAKE_NGN);
 
-  const shouldTrade = compositeScore > threshold && netEdge > 0;
+const direction = momentumScore >= 0 ? 'YES' : 'NO';
+const directionalEdge = direction === 'YES' ? netEdge : -(pUp - Number(state.yesPrice)) - (fee / 100);
+const shouldTrade = compositeScore > threshold && directionalEdge > 0;
 
   return {
     shouldTrade,
-    direction: shouldTrade ? (momentumScore >= 0 ? 'YES' : 'NO') : null,
+    direction: shouldTrade ? direction : null,
     pUp,
     netEdge,
     confidence: compositeScore,
