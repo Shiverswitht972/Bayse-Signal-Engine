@@ -1,6 +1,5 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
 import { CURRENCY } from './config.js';
-
 async function postSigned(path, bodyObj) {
   const body = JSON.stringify(bodyObj);
   const response = await fetch(`${BASE_URL}${path}`, {
@@ -38,6 +37,7 @@ export async function executeOrder(signal, state) {
     const order = await postSigned(`${pathBase}/orders`, payload);
 
     state.lastTradeAt = new Date().toISOString();
+    state.dailyPnL -= Number(signal.stake);
 
     return {
       success: true,
