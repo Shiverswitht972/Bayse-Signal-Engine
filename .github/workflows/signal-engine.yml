@@ -1,0 +1,31 @@
+name: Bayse Signal Engine
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-engine:
+    runs-on: ubuntu-latest
+
+    env:
+      BAYSE_PUBLIC_KEY: ${{ secrets.BAYSE_PUBLIC_KEY }}
+      BAYSE_SECRET_KEY: ${{ secrets.BAYSE_SECRET_KEY }}
+      # TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      # TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run signal engine
+        run: node src/run.js
