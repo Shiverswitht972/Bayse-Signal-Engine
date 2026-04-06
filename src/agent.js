@@ -290,6 +290,7 @@ export async function startAgent() {
       }));
     },
     onMessage: async (message) => {
+      console.log('[debug] asset-prices message:', JSON.stringify(message));
       if (message.type !== 'asset_price' && message.channel !== 'asset_prices') {
         return;
       }
@@ -312,9 +313,8 @@ export async function startAgent() {
       }));
     },
     onMessage: async (message) => {
+      console.log('[debug] market-prices message:', JSON.stringify(message));
       updateOdds(message);
     },
-  });
-}
 
 export { state };
