@@ -312,10 +312,11 @@ export async function startAgent() {
       eventId: event.eventId,
     }));
   },
-  onMessage: async (message) => {
+ onMessage: async (message) => {
     console.log('[debug] market-prices message:', JSON.stringify(message));
     updateOdds(message);
   },
 });
+}
 
 export { state };
