@@ -7,7 +7,7 @@ import { sendNotification } from './notify.js';
 export const MAX_STAKE_NGN = 6500;
 export const DAILY_LOSS_FLOOR = 500;
 export const KELLY_FRACTION = 0.5;
-export const MIN_STAKE_NGN = 50;
+export const MIN_STAKE_NGN = 150;
 export const CURRENCY = 'NGN';
 
 const MIN_HISTORY_POINTS = 6;

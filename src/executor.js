@@ -1,6 +1,5 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
-import { CURRENCY } from './agent.js';
-
+import { CURRENCY } from './config.js';
 async function postSigned(path, bodyObj) {
   const body = JSON.stringify(bodyObj);
   const response = await fetch(`${BASE_URL}${path}`, {

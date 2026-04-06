@@ -1,9 +1,4 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
-import {
-  CURRENCY,
-  KELLY_FRACTION,
-  MAX_STAKE_NGN,
-  MIN_STAKE_NGN,
   getCandles,
 } from './agent.js';
 

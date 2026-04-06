@@ -5,8 +5,8 @@ import {
   KELLY_FRACTION,
   MAX_STAKE_NGN,
   MIN_STAKE_NGN,
-  startAgent,
-} from './agent.js';
+} from './config.js';
+import { startAgent } from './agent.js';
 
 const ts = new Date().toISOString();
 console.log('=====================================');
