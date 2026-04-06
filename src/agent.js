@@ -316,5 +316,6 @@ export async function startAgent() {
       console.log('[debug] market-prices message:', JSON.stringify(message));
       updateOdds(message);
     },
+});
 
 export { state };
