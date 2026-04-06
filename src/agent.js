@@ -167,15 +167,14 @@ async function refreshEventContext() {
 
 async function refreshBalance() {
   try {
-    const data = await fetchJson('/v1/user/me/wallet');
-    console.log('[debug] portfolio response:', JSON.stringify(data));
-    const extracted = data?.balances?.NGN ?? data?.wallet?.NGN ?? data?.balance ?? null;
-    const numericBalance = Number(extracted);
-
-    state.balance = Number.isFinite(numericBalance) ? numericBalance : null;
+    // TODO: replace with correct Bayse wallet endpoint once confirmed
+    // Hardcoded to test account starting balance
+    if (state.balance === null) {
+      state.balance = 1000;
+      state.dayStartBalance = 1000;
+    }
     resetDailyPnlIfNeeded();
-
-    console.log(`[agent] Balance refreshed: ${state.balance ?? 'unavailable'} ${CURRENCY}`);
+    console.log(`[agent] Balance set: ${state.balance} ${CURRENCY}`);
   } catch (error) {
     console.error('[agent] Balance refresh failed:', error.message);
   }
