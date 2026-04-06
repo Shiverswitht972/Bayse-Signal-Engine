@@ -304,18 +304,18 @@ export async function startAgent() {
   });
 
   createReconnectableWs('market-prices', 'wss://socket.bayse.markets/ws/v1/markets', {
-    onOpen: async (socket) => {
-      const event = await refreshEventContext();
-      socket.send(JSON.stringify({
-        type: 'subscribe',
-        channel: 'prices',
-        eventId: event.eventId,
-      }));
-    },
-    onMessage: async (message) => {
-      console.log('[debug] market-prices message:', JSON.stringify(message));
-      updateOdds(message);
-    },
+  onOpen: async (socket) => {
+    const event = await refreshEventContext();
+    socket.send(JSON.stringify({
+      type: 'subscribe',
+      channel: 'prices',
+      eventId: event.eventId,
+    }));
+  },
+  onMessage: async (message) => {
+    console.log('[debug] market-prices message:', JSON.stringify(message));
+    updateOdds(message);
+  },
 });
 
 export { state };
