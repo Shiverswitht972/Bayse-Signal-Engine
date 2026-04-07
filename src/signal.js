@@ -100,9 +100,14 @@ function computeVolumeScore(candles, momentumScore) {
   return clamp(trend * directional, -1, 1);
 }
 
-async function fetchQuoteFee(eventId, marketId) {
+async function fetchQuoteFee(eventId, marketId, outcomeId) {
   const path = `/v1/pm/events/${eventId}/markets/${marketId}/quote`;
-  const bodyObj = { side: 'BUY', outcome: 'YES', amount: 100, currency: CURRENCY };
+  const bodyObj = {
+    side: 'BUY',
+    outcomeId,
+    amount: 100,
+    currency: CURRENCY,
+  };
   const body = JSON.stringify(bodyObj);
 
   const response = await fetch(`${BASE_URL}${path}`, {
@@ -124,9 +129,12 @@ export async function generateSignal(state) {
   const pUp = 1 - Number(state.yesPrice);
   const rawEdge = pUp - Number(state.yesPrice);
 
+  const direction = pUp >= 0.5 ? 'YES' : 'NO';
+  const outcomeId = direction === 'YES' ? state.outcome1Id : state.outcome2Id;
+
   let fee;
   try {
-    fee = await fetchQuoteFee(state.eventId, state.marketId);
+    fee = await fetchQuoteFee(state.eventId, state.marketId, outcomeId);
   } catch (error) {
     return {
       shouldTrade: false,
@@ -157,17 +165,16 @@ export async function generateSignal(state) {
 
   const kelly = state.yesPrice > 0 ? netEdge / state.yesPrice : 0;
   const rawStake = kelly * state.balance * KELLY_FRACTION;
-  const stake = clamp(rawStake, MIN_STAKE_NGN, MAX_STAKE_NGN);
+  const stake = clamp(rawStake, MIN_STAKE_NGN, Math.min(MAX_STAKE_NGN, state.balance));
 
-const direction = momentumScore >= 0 ? 'YES' : 'NO';
-const directionalEdge = direction === 'YES' ? netEdge : -(pUp - Number(state.yesPrice)) - (fee / 100);
-const shouldTrade = compositeScore > threshold && directionalEdge > 0;
+  const directionalEdge = direction === 'YES' ? netEdge : -(pUp - Number(state.yesPrice)) - (fee / 100);
+  const shouldTrade = compositeScore > threshold && directionalEdge > 0;
 
   return {
     shouldTrade,
     direction: shouldTrade ? direction : null,
     pUp,
-    netEdge,
+    netEdge: directionalEdge,
     confidence: compositeScore,
     stake: Number(stake.toFixed(2)),
     reason: shouldTrade
