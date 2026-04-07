@@ -134,8 +134,12 @@ export async function generateSignal(state) {
 
   let fee;
   try {
-    fee = await fetchQuoteFee(state.eventId, state.marketId, outcomeId);
-  } catch (error) {
+  fee = await fetchQuoteFee(state.eventId, state.marketId, outcomeId);
+} catch (error) {
+  if (error.message.includes('no liquidity')) {
+    console.log('[signal] no liquidity for quote, using fallback fee estimate');
+    fee = 5; // conservative fallback: 5% fee estimate
+  } else {
     return {
       shouldTrade: false,
       direction: null,
@@ -147,6 +151,8 @@ export async function generateSignal(state) {
       delta5m: 0,
     };
   }
+}
+
 
   const netEdge = rawEdge - fee / 100;
 
