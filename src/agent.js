@@ -130,14 +130,18 @@ function parseOpenBtcEvent(payload) {
   const events = payload?.data ?? payload?.events ?? payload ?? [];
   const list = Array.isArray(events) ? events : [];
 
-  const btcEvent = list.find((event) => {
-    const title = String(event.title ?? event.name ?? '').toUpperCase();
-    const symbol = String(event.symbol ?? '').toUpperCase();
-    return title.includes('BTC') || symbol.includes('BTC');
-  });
+  const btcEvent =
+    list.find((event) => {
+      const title = String(event.title ?? event.name ?? '').toUpperCase();
+      return title.includes('UP') && title.includes('DOWN') && title.includes('BTC');
+    }) ??
+    list.find((event) => {
+      const title = String(event.title ?? event.name ?? '').toUpperCase();
+      return title.includes('BITCOIN') && (title.includes('UP') || title.includes('DOWN'));
+    });
 
   if (!btcEvent) {
-    throw new Error('No open BTC event found');
+    throw new Error('No open BTC UP/DOWN event found');
   }
 
   const market = btcEvent.market ?? btcEvent.markets?.[0] ?? {};
@@ -163,6 +167,7 @@ async function refreshEventContext() {
     throw new Error('Event context is missing eventId or marketId');
   }
 
+  console.log(`[agent] Event context: ${state.eventTitle} (${state.eventId})`);
   return eventContext;
 }
 
@@ -184,16 +189,17 @@ async function refreshOdds() {
     const payload = await fetchJson(
       `/v1/pm/events/${state.eventId}?currency=NGN`
     );
-    console.log('[debug] odds payload:', JSON.stringify(payload));
+
+    const markets = payload?.markets ?? payload?.data?.markets ?? [];
     const market = markets.find(m => m.id === state.marketId) ?? markets[0];
+
     if (!market) {
       console.log('[odds] No matching market found in event response');
       return;
     }
 
-    const prices = market.prices ?? {};
-    const yes = Number(prices.YES ?? prices.yes);
-    const no = Number(prices.NO ?? prices.no);
+    const yes = Number(market.outcome1Price ?? market.prices?.YES ?? market.prices?.yes);
+    const no = Number(market.outcome2Price ?? market.prices?.NO ?? market.prices?.no);
 
     if (Number.isFinite(yes)) state.yesPrice = yes;
     if (Number.isFinite(no)) state.noPrice = no;
@@ -230,8 +236,7 @@ function addPriceTick(tick) {
 
   state.btcPrice = price;
 
-  const now = Date.now();
-  const cutoff = now - 60 * 60 * 1000;
+  const cutoff = Date.now() - 60 * 60 * 1000;
   state.priceHistory = state.priceHistory.filter(
     t => new Date(t.timestamp).getTime() > cutoff
   );
@@ -292,6 +297,16 @@ export async function startAgent() {
 
   setInterval(refreshBalance, BALANCE_REFRESH_MS);
   setInterval(refreshOdds, ODDS_REFRESH_MS);
+
+  // Also refresh event context every 15 minutes to pick up new market windows
+  setInterval(async () => {
+    try {
+      await refreshEventContext();
+      await refreshOdds();
+    } catch (err) {
+      console.error('[agent] Event context refresh failed:', err.message);
+    }
+  }, MINUTES_BETWEEN_TRADES * 60 * 1000);
 
   createReconnectableWs('asset-prices', 'wss://socket.bayse.markets/ws/v1/realtime', {
     onOpen: async (socket) => {
