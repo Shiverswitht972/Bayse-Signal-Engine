@@ -27,6 +27,8 @@ const state = {
   marketId: null,
   eventTitle: null,
   resolvesAt: null,
+  outcome1Id: null,
+  outcome2Id: null,
   balance: null,
   lastTradeAt: null,
   dailyPnL: 0,
@@ -204,7 +206,10 @@ async function refreshOdds() {
     if (Number.isFinite(yes)) state.yesPrice = yes;
     if (Number.isFinite(no)) state.noPrice = no;
 
-    console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice}`);
+    if (market.outcome1Id) state.outcome1Id = market.outcome1Id;
+    if (market.outcome2Id) state.outcome2Id = market.outcome2Id;
+
+    console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice} outcome1Id=${state.outcome1Id} outcome2Id=${state.outcome2Id}`);
   } catch (err) {
     console.error('[odds] refresh failed:', err.message);
   }
@@ -298,7 +303,6 @@ export async function startAgent() {
   setInterval(refreshBalance, BALANCE_REFRESH_MS);
   setInterval(refreshOdds, ODDS_REFRESH_MS);
 
-  // Also refresh event context every 15 minutes to pick up new market windows
   setInterval(async () => {
     try {
       await refreshEventContext();
