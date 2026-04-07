@@ -14,6 +14,7 @@ const MIN_HISTORY_POINTS = 6;
 const MINUTES_BETWEEN_TRADES = 15;
 const MARKET_END_BUFFER_MINUTES = 3;
 const BALANCE_REFRESH_MS = 5 * 60 * 1000;
+const ODDS_REFRESH_MS = 30_000;
 const WS_BACKOFF_START_MS = 2_000;
 const WS_BACKOFF_MAX_MS = 30_000;
 
@@ -133,10 +134,10 @@ function parseOpenBtcEvent(payload) {
     const title = String(event.title ?? event.name ?? '').toUpperCase();
     const symbol = String(event.symbol ?? '').toUpperCase();
     return title.includes('BTC') || symbol.includes('BTC');
-  }) ?? list[0];
+  });
 
   if (!btcEvent) {
-    throw new Error('No open crypto event found');
+    throw new Error('No open BTC event found');
   }
 
   const market = btcEvent.market ?? btcEvent.markets?.[0] ?? {};
@@ -167,8 +168,6 @@ async function refreshEventContext() {
 
 async function refreshBalance() {
   try {
-    // TODO: replace with correct Bayse wallet endpoint once confirmed
-    // Hardcoded to test account starting balance
     if (state.balance === null) {
       state.balance = 1000;
       state.dayStartBalance = 1000;
@@ -177,6 +176,31 @@ async function refreshBalance() {
     console.log(`[agent] Balance set: ${state.balance} ${CURRENCY}`);
   } catch (error) {
     console.error('[agent] Balance refresh failed:', error.message);
+  }
+}
+
+async function refreshOdds() {
+  try {
+    const payload = await fetchJson(
+      `/v1/pm/events/${state.eventId}?currency=NGN`
+    );
+    const markets = payload?.markets ?? payload?.data?.markets ?? [];
+    const market = markets.find(m => m.id === state.marketId) ?? markets[0];
+    if (!market) {
+      console.log('[odds] No matching market found in event response');
+      return;
+    }
+
+    const prices = market.prices ?? {};
+    const yes = Number(prices.YES ?? prices.yes);
+    const no = Number(prices.NO ?? prices.no);
+
+    if (Number.isFinite(yes)) state.yesPrice = yes;
+    if (Number.isFinite(no)) state.noPrice = no;
+
+    console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice}`);
+  } catch (err) {
+    console.error('[odds] refresh failed:', err.message);
   }
 }
 
@@ -205,35 +229,14 @@ function addPriceTick(tick) {
   const timestamp = tick.timestamp ?? tick.ts ?? new Date().toISOString();
 
   state.btcPrice = price;
-  state.priceHistory.push({
-    price,
-    timestamp,
-    volume: Number(tick.volume ?? 1),
-  });
 
-  if (state.priceHistory.length > 60) {
-    state.priceHistory.splice(0, state.priceHistory.length - 60);
-  }
-}
+  const now = Date.now();
+  const cutoff = now - 60 * 60 * 1000;
+  state.priceHistory = state.priceHistory.filter(
+    t => new Date(t.timestamp).getTime() > cutoff
+  );
 
-function updateOdds(payload) {
-  if (payload.type !== 'price_update') return;
-
-  const markets = payload?.data?.markets ?? [];
-  const market = markets.find(m => m.id === state.marketId) ?? markets[0];
-  if (!market) return;
-
-  const prices = market.prices ?? {};
-  const yes = Number(prices.YES ?? prices.yes);
-  const no = Number(prices.NO ?? prices.no);
-
-  if (Number.isFinite(yes)) state.yesPrice = yes;
-  if (Number.isFinite(no)) state.noPrice = no;
-
-  if (payload.data?.id) state.eventId = payload.data.id;
-  if (market.id) state.marketId = market.id;
-
-  console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice}`);
+  state.priceHistory.push({ price, timestamp, volume: Number(tick.volume ?? 1) });
 }
 
 function createReconnectableWs(name, url, handlers) {
@@ -285,7 +288,10 @@ export async function startAgent() {
 
   await refreshEventContext();
   await refreshBalance();
+  await refreshOdds();
+
   setInterval(refreshBalance, BALANCE_REFRESH_MS);
+  setInterval(refreshOdds, ODDS_REFRESH_MS);
 
   createReconnectableWs('asset-prices', 'wss://socket.bayse.markets/ws/v1/realtime', {
     onOpen: async (socket) => {
@@ -296,10 +302,7 @@ export async function startAgent() {
       }));
     },
     onMessage: async (message) => {
-      console.log('[debug] asset-prices message:', JSON.stringify(message));
-      if (message.type !== 'asset_price' && message.channel !== 'asset_prices') {
-        return;
-      }
+      if (message.type !== 'asset_price') return;
 
       addPriceTick(message.data ?? message);
 
@@ -308,22 +311,6 @@ export async function startAgent() {
       }
     },
   });
-
-  createReconnectableWs('market-prices', 'wss://socket.bayse.markets/ws/v1/markets', {
-  onOpen: async (socket) => {
-  const event = await refreshEventContext();
-  console.log(`[ws:market-prices] subscribing to eventId: ${event.eventId}`);
-  socket.send(JSON.stringify({
-    type: 'subscribe',
-    channel: 'prices',
-    eventId: event.eventId,
-  }));
-},
- onMessage: async (message) => {
-    console.log('[debug] market-prices message:', JSON.stringify(message));
-    updateOdds(message);
-  },
-});
 }
 
 export { state };
