@@ -184,7 +184,7 @@ async function refreshOdds() {
     const payload = await fetchJson(
       `/v1/pm/events/${state.eventId}?currency=NGN`
     );
-    const markets = payload?.markets ?? payload?.data?.markets ?? [];
+    console.log('[debug] odds payload:', JSON.stringify(payload));
     const market = markets.find(m => m.id === state.marketId) ?? markets[0];
     if (!market) {
       console.log('[odds] No matching market found in event response');
