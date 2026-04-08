@@ -19,7 +19,7 @@ index 0000000000000000000000000000000000000000..d5cb06258dc420a73d81837bbd7014b1
 +export const WS_BACKOFF_MAX_MS = 30_000;
 +
 +
-+export const ALPHA_ENABLED = false;
++export const ALPHA_ENABLED = true;
 +export const MIN_VOL_THRESHOLD = 0.0005;
 +export const ALPHA_MIN_STRENGTH = 0.1;
 +export const ALPHA_EARLY_OVERRIDE_STRENGTH = 0.2;
