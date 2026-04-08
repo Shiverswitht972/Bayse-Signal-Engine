@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/src/auth.js b/src/auth.js
 index 0fee4d46ea38ef8320de927cd710275cdb97d56b..933cc9436746c4bc1aa57c576b2f6c3c024cec4c 100644
 --- a/src/auth.js
