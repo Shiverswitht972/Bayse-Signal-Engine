@@ -1,6 +1,13 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
 import { getCandles } from './candles.js';
-import { CURRENCY, KELLY_FRACTION, MAX_STAKE_NGN, MIN_STAKE_NGN } from './config.js';
+import {
+  CURRENCY,
+  KELLY_FRACTION,
+  MAX_STAKE_NGN,
+  MIN_STAKE_NGN,
+} from './config.js';
+
+const QUOTE_FEE_PROBE_AMOUNT = 100;
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);

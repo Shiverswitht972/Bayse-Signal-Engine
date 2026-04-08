@@ -269,6 +269,16 @@ function updateOdds(payload) {
 
   for (const data of entries) {
     if (!data || typeof data !== "object") continue;
+    const incomingEventId = data.eventId ?? null;
+    const incomingMarketId = data.marketId ?? null;
+
+    if (incomingEventId && state.eventId && incomingEventId !== state.eventId) {
+      continue;
+    }
+
+    if (incomingMarketId && state.marketId && incomingMarketId !== state.marketId) {
+      continue;
+    }
 
     const yes = Number(data.yesPrice ?? data.yes ?? data.prices?.yes);
     const no = Number(data.noPrice ?? data.no ?? data.prices?.no);
