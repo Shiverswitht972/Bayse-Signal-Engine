@@ -286,8 +286,8 @@ function updateOdds(payload) {
     if (Number.isFinite(yes)) state.yesPrice = yes;
     if (Number.isFinite(no)) state.noPrice = no;
 
-    if (incomingEventId && !state.eventId) state.eventId = incomingEventId;
-    if (incomingMarketId && !state.marketId) state.marketId = incomingMarketId;
+    if (data.eventId) state.eventId = data.eventId;
+    if (data.marketId) state.marketId = data.marketId;
     if (data.resolvesAt) state.resolvesAt = data.resolvesAt;
 
     const outcomeName = String(data.outcome ?? data.name ?? '').toUpperCase();
@@ -448,4 +448,4 @@ export async function startAgent() {
   });
 }
 
-export { state };
+export { state }

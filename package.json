@@ -13,4 +13,5 @@
     "ws": "^8.18.0"
   },
   "packageManager": "npm@10.8.2"
+  }
 }
