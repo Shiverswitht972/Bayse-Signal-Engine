@@ -1,10 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/src/executor.js b/src/executor.js
-new file mode 100644
-index 0000000000000000000000000000000000000000..f628fbd23c4cffcc93827ef7b84574ff19676b4e
---- /dev/null
-+++ b/src/executor.js
-@@ -0,0 +1,69 @@
 +import { BASE_URL, buildWriteHeaders } from './auth.js';
 +import { CURRENCY } from './config.js';
 +
@@ -74,6 +67,3 @@ index 0000000000000000000000000000000000000000..f628fbd23c4cffcc93827ef7b84574ff
 +    };
 +  }
 +}
- 
-EOF
-)
