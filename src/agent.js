@@ -31,8 +31,6 @@ const state = {
   dailyPnL: 0,
   dailyPnLResetDate: null,
   dayStartBalance: null,
-  oddsWaitSince: null,
-  lastOddsWaitLogAt: null,
 };
 
 export { getCandles } from './candles.js';
@@ -288,8 +286,8 @@ function updateOdds(payload) {
     if (Number.isFinite(yes)) state.yesPrice = yes;
     if (Number.isFinite(no)) state.noPrice = no;
 
-    if (incomingEventId && !state.eventId) state.eventId = incomingEventId;
-    if (incomingMarketId && !state.marketId) state.marketId = incomingMarketId;
+    if (data.eventId) state.eventId = data.eventId;
+    if (data.marketId) state.marketId = data.marketId;
     if (data.resolvesAt) state.resolvesAt = data.resolvesAt;
 
     const outcomeName = String(data.outcome ?? data.name ?? '').toUpperCase();
@@ -420,33 +418,9 @@ export async function startAgent() {
       addPriceTick(tick);
 
       if (state.yesPrice == null) {
-        const now = Date.now();
-        const oddsWaitTimeoutMs = 2 * 60 * 1000;
-        const oddsWaitLogIntervalMs = 30 * 1000;
-
-        if (state.oddsWaitSince == null) {
-          state.oddsWaitSince = now;
-        }
-
-        const elapsedMs = now - state.oddsWaitSince;
-        const shouldLog =
-          state.lastOddsWaitLogAt == null ||
-          now - state.lastOddsWaitLogAt >= oddsWaitLogIntervalMs;
-
-        if (shouldLog) {
-          if (elapsedMs >= oddsWaitTimeoutMs) {
-            console.warn('[signal] odds unavailable after timeout; skipping evaluation until odds update arrives');
-          } else {
-            console.log('[signal] waiting for odds update before evaluation');
-          }
-          state.lastOddsWaitLogAt = now;
-        }
-
+        console.log('[signal] waiting for odds update before evaluation');
         return;
       }
-
-      state.oddsWaitSince = null;
-      state.lastOddsWaitLogAt = null;
 
       await evaluateAndMaybeTrade();
     },
@@ -468,12 +442,10 @@ export async function startAgent() {
 
       updateOdds(message);
       if (state.yesPrice != null || state.noPrice != null) {
-        state.oddsWaitSince = null;
-        state.lastOddsWaitLogAt = null;
         console.log(`[ws:market-prices] odds updated yes=${state.yesPrice} no=${state.noPrice}`);
       }
     },
   });
 }
 
-export { state };
+export { state }
