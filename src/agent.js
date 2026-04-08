@@ -1,3 +1,4 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/src/agent.js b/src/agent.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..c9d114d3c3c1ec060e29d2da7df9114ade05ed53
@@ -445,3 +446,6 @@ index 0000000000000000000000000000000000000000..c9d114d3c3c1ec060e29d2da7df9114a
 +}
 +
 +export { state };
+ 
+EOF
+)
