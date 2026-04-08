@@ -25,11 +25,9 @@ import crypto from 'node:crypto';
    const publicKey = getEnvOrThrow('BAYSE_PUBLIC_KEY');
    const secretKey = getEnvOrThrow('BAYSE_SECRET_KEY');
 
-  const timestamp = String(Date.now());
   const timestamp = String(Math.floor(Date.now() / 1000));
   const upperMethod = method.toUpperCase();
   const bodyHash = hashBody(body);
-  const payload = `${timestamp}.${method.toUpperCase()}.${path}.${bodyHash}`;
   const payload = `${timestamp}.${upperMethod}.${path}.${bodyHash}`;
  
    const signature = crypto
