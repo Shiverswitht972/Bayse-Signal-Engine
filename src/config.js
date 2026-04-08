@@ -1,12 +1,30 @@
-export const MAX_STAKE_NGN = 6500;
-export const DAILY_LOSS_FLOOR = 500;
-export const KELLY_FRACTION = 0.5;
-export const MIN_STAKE_NGN = 150;
-export const CURRENCY = 'NGN';
-
-export const MIN_HISTORY_POINTS = 6;
-export const MINUTES_BETWEEN_TRADES = 15;
-export const MARKET_END_BUFFER_MINUTES = 3;
-export const BALANCE_REFRESH_MS = 5 * 60 * 1000;
-export const WS_BACKOFF_START_MS = 2_000;
-export const WS_BACKOFF_MAX_MS = 30_000;
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/src/config.js b/src/config.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5cb06258dc420a73d81837bbd7014b149fa7ae8
+--- /dev/null
++++ b/src/config.js
+@@ -0,0 +1,20 @@
++export const MAX_STAKE_NGN = 6500;
++export const DAILY_LOSS_FLOOR = 500;
++export const KELLY_FRACTION = 0.5;
++export const MIN_STAKE_NGN = 150;
++export const CURRENCY = 'NGN';
++
++export const MIN_HISTORY_POINTS = 6;
++export const MINUTES_BETWEEN_TRADES = 15;
++export const MARKET_END_BUFFER_MINUTES = 3;
++export const BALANCE_REFRESH_MS = 5 * 60 * 1000;
++export const WS_BACKOFF_START_MS = 2_000;
++export const WS_BACKOFF_MAX_MS = 30_000;
++
++
++export const ALPHA_ENABLED = false;
++export const MIN_VOL_THRESHOLD = 0.0005;
++export const ALPHA_MIN_STRENGTH = 0.1;
++export const ALPHA_EARLY_OVERRIDE_STRENGTH = 0.2;
++export const ALPHA_EARLY_MINUTE = 5;
++export const ALPHA_LATE_MINUTE = 12;
+ 
+EOF
+)
