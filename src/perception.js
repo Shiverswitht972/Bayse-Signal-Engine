@@ -1,4 +1,3 @@
-import fetch from 'node-fetch';
 import { BASE_URL, buildReadHeaders } from './auth.js';
 
 function toNumber(value) {
