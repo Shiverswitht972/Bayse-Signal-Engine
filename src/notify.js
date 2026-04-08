@@ -23,7 +23,6 @@ export async function sendNotification(signal, result, state) {
     `Edge   : ${Number(signal.netEdge ?? 0).toFixed(4)}`,
     `Conf   : ${Number(signal.confidence ?? 0).toFixed(4)}`,
     `Signal : BUY ${signal.direction ?? 'NONE'}`,
-    `Source : ${signal.decision?.source ?? 'base'}`,
     '',
     'Execution',
     `Stake  : N${Number(signal.stake ?? 0).toFixed(2)}`,

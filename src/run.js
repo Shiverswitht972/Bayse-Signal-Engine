@@ -8,8 +8,6 @@ import {
 } from './config.js';
 import { startAgent } from './agent.js';
 
-const START_RETRY_MS = 30_000;
-
 const ts = new Date().toISOString();
 console.log('=====================================');
 console.log(`[${ts}] Bayse Signal Engine booting`);
@@ -18,14 +16,7 @@ console.log(
 );
 console.log('=====================================');
 
-async function bootAgentWithRetry() {
-  try {
-    await startAgent();
-  } catch (error) {
-    console.error('[fatal] agent startup failed:', error.message);
-    console.error(`[fatal] retrying agent startup in ${START_RETRY_MS / 1000}s`);
-    setTimeout(bootAgentWithRetry, START_RETRY_MS);
-  }
-}
-
-bootAgentWithRetry();
+startAgent().catch((error) => {
+  console.error('[fatal] agent failed during startup:', error);
+  process.exit(1);
+});

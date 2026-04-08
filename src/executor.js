@@ -1,13 +1,5 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
 import { CURRENCY } from './config.js';
-
-function resolveOutcomeId(signal, state) {
-  if (signal.direction === 'YES') return state.yesOutcomeId;
-  if (signal.direction === 'NO') return state.noOutcomeId;
-  return null;
-}
-
-
 async function postSigned(path, bodyObj) {
   const body = JSON.stringify(bodyObj);
   const response = await fetch(`${BASE_URL}${path}`, {
@@ -27,14 +19,9 @@ async function postSigned(path, bodyObj) {
 export async function executeOrder(signal, state) {
   try {
     const pathBase = `/v1/pm/events/${state.eventId}/markets/${state.marketId}`;
-    const outcomeId = resolveOutcomeId(signal, state);
-    if (!outcomeId) {
-      return { success: false, reason: `Missing outcomeId for direction ${signal.direction}` };
-    }
-
     const payload = {
       side: 'BUY',
-      outcomeId,
+      outcome: signal.direction,
       amount: signal.stake,
       currency: CURRENCY,
     };
@@ -50,6 +37,7 @@ export async function executeOrder(signal, state) {
     const order = await postSigned(`${pathBase}/orders`, payload);
 
     state.lastTradeAt = new Date().toISOString();
+    state.dailyPnL -= Number(signal.stake);
 
     return {
       success: true,
