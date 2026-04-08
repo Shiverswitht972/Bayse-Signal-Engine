@@ -64,14 +64,36 @@ function macd(closes) {
   };
 }
 
+function computeDelta5m(priceHistory) {
+  if (priceHistory.length < 2) return 0;
+
+  const latest = priceHistory.at(-1);
+  const latestTs = new Date(latest.timestamp).getTime();
+  if (!Number.isFinite(latestTs)) return 0;
+
+  const targetTs = latestTs - 5 * 60 * 1000;
+  let baseline = null;
+
+  for (let i = priceHistory.length - 2; i >= 0; i -= 1) {
+    const tick = priceHistory[i];
+    const tickTs = new Date(tick.timestamp).getTime();
+    if (!Number.isFinite(tickTs)) continue;
+
+    if (tickTs <= targetTs) {
+      baseline = tick;
+      break;
+    }
+  }
+
+  if (!baseline || !baseline.price) return 0;
+  return ((latest.price - baseline.price) / baseline.price) * 100;
+}
+
 function computeMomentum(priceHistory, candles) {
   const closes = candles.map((c) => c.close);
   const rsi = rsiWilder(closes, 14);
   const macdValues = macd(closes);
-
-  const latest = priceHistory.at(-1)?.price;
-  const from5 = priceHistory.at(-6)?.price;
-  const delta5m = latest && from5 ? ((latest - from5) / from5) * 100 : 0;
+  const delta5m = computeDelta5m(priceHistory);
 
   const rsiScore = rsi == null ? 0 : rsi > 55 ? 1 : rsi < 45 ? -1 : 0;
   const macdScore =
@@ -100,12 +122,12 @@ function computeVolumeScore(candles, momentumScore) {
   return clamp(trend * directional, -1, 1);
 }
 
-async function fetchQuoteFee(eventId, marketId, outcomeId) {
+async function fetchQuoteFeeRatio(eventId, marketId) {
   const path = `/v1/pm/events/${eventId}/markets/${marketId}/quote`;
   const bodyObj = {
     side: 'BUY',
-    outcomeId,
-    amount: 100,
+    outcome: 'YES',
+    amount: QUOTE_FEE_PROBE_AMOUNT,
     currency: CURRENCY,
   };
   const body = JSON.stringify(bodyObj);
@@ -122,24 +144,37 @@ async function fetchQuoteFee(eventId, marketId, outcomeId) {
   }
 
   const data = await response.json();
-  return Number(data.fee ?? data.quote?.fee ?? 0);
+
+  const feeAmount = Number(data.fee ?? data.quote?.fee ?? data.fees?.total ?? 0);
+  const feeRate = Number(data.feeRate ?? data.quote?.feeRate ?? data.fees?.rate ?? Number.NaN);
+
+  if (Number.isFinite(feeRate) && feeRate >= 0) {
+    return feeRate > 1 ? feeRate / 100 : feeRate;
+  }
+
+  if (feeAmount <= 0) return 0;
+
+  // Convert absolute fee paid for probe amount into a probability/edge-equivalent ratio.
+  return feeAmount / QUOTE_FEE_PROBE_AMOUNT;
 }
 
 export async function generateSignal(state) {
-  const pUp = 1 - Number(state.yesPrice);
-  const rawEdge = pUp - Number(state.yesPrice);
+  const yesPrice = Number(state.yesPrice);
+  const marketImpliedP = clamp(yesPrice, 0, 1);
 
-  const direction = pUp >= 0.5 ? 'YES' : 'NO';
-  const outcomeId = direction === 'YES' ? state.outcome1Id : state.outcome2Id;
+  const candles = getCandles(state.priceHistory);
+  const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
+  const volumeScore = computeVolumeScore(candles, momentumScore);
 
-  let fee;
+  const modelP = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
+  const pUp = clamp(modelP * 0.7 + marketImpliedP * 0.3, 0, 1);
+
+  const rawEdge = pUp - yesPrice;
+
+  let feeRatio;
   try {
-  fee = await fetchQuoteFee(state.eventId, state.marketId, outcomeId);
-} catch (error) {
-  if (error.message.includes('no liquidity')) {
-    console.log('[signal] no liquidity for quote, using fallback fee estimate');
-    fee = 5; // conservative fallback: 5% fee estimate
-  } else {
+    feeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId);
+  } catch (error) {
     return {
       shouldTrade: false,
       direction: null,
@@ -148,33 +183,36 @@ export async function generateSignal(state) {
       confidence: 0,
       stake: 0,
       reason: `Could not fetch quote fee: ${error.message}`,
-      delta5m: 0,
+      delta5m,
     };
   }
-}
 
-
-  const netEdge = rawEdge - fee / 100;
-
-  const candles = getCandles(state.priceHistory);
-  const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
-  const volumeScore = computeVolumeScore(candles, momentumScore);
+  const netEdge = rawEdge - feeRatio;
   const oddsDivergence = clamp(netEdge, -1, 1);
 
   const compositeScore =
     oddsDivergence * 0.4 + momentumScore * 0.35 + volumeScore * 0.25;
 
-  let threshold = state.yesPrice >= 0.4 && state.yesPrice <= 0.6 ? 0.65 : 0.55;
+  let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
   if (Math.abs(delta5m) > 0.5) {
     threshold -= 0.05;
   }
 
-  const kelly = state.yesPrice > 0 ? netEdge / state.yesPrice : 0;
-  const rawStake = kelly * state.balance * KELLY_FRACTION;
-  const stake = clamp(rawStake, MIN_STAKE_NGN, Math.min(MAX_STAKE_NGN, state.balance));
+  const direction = pUp >= 0.5 ? 'YES' : 'NO';
+  const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
+  const directionalEdge =
+    direction === 'YES' ? netEdge : -(pUp - yesPrice) - feeRatio;
 
-  const directionalEdge = direction === 'YES' ? netEdge : -(pUp - Number(state.yesPrice)) - (fee / 100);
-  const shouldTrade = compositeScore > threshold && directionalEdge > 0;
+  const kelly = pricedSide > 0 ? directionalEdge / pricedSide : 0;
+  const rawStake = kelly * state.balance * KELLY_FRACTION;
+  const maxAffordableStake = Math.min(MAX_STAKE_NGN, state.balance);
+  const hasMinimumBalanceForStake = maxAffordableStake >= MIN_STAKE_NGN;
+  const stake = hasMinimumBalanceForStake
+    ? clamp(rawStake, MIN_STAKE_NGN, maxAffordableStake)
+    : 0;
+
+  const shouldTrade =
+    compositeScore > threshold && directionalEdge > 0 && hasMinimumBalanceForStake;
 
   return {
     shouldTrade,
@@ -185,7 +223,9 @@ export async function generateSignal(state) {
     stake: Number(stake.toFixed(2)),
     reason: shouldTrade
       ? 'Composite signal crossed dynamic threshold'
-      : `Composite score ${compositeScore.toFixed(3)} did not beat threshold ${threshold.toFixed(3)}`,
+      : hasMinimumBalanceForStake
+        ? `Composite score ${compositeScore.toFixed(3)} did not beat threshold ${threshold.toFixed(3)} or edge <= 0`
+        : `Insufficient balance for minimum stake (${MIN_STAKE_NGN} ${CURRENCY})`,
     delta5m,
   };
 }
