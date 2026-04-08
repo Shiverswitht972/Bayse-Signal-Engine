@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/src/config.js b/src/config.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..d5cb06258dc420a73d81837bbd7014b149fa7ae8
@@ -25,6 +24,3 @@ index 0000000000000000000000000000000000000000..d5cb06258dc420a73d81837bbd7014b1
 +export const ALPHA_EARLY_OVERRIDE_STRENGTH = 0.2;
 +export const ALPHA_EARLY_MINUTE = 5;
 +export const ALPHA_LATE_MINUTE = 12;
- 
-EOF
-)
