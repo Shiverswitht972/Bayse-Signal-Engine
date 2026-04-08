@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: bayse-signal-engine
+    runtime: node
+    buildCommand: npm install
+    startCommand: node src/run.js
+    envVars:
+      - key: BAYSE_PUBLIC_KEY
+        sync: false
+      - key: BAYSE_SECRET_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ALPHA_ENABLED
+        value: "false"

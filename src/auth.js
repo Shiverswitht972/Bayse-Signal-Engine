@@ -16,20 +16,18 @@ function hashBody(body) {
 }
 
 export function buildReadHeaders() {
-  const publicKey = getEnvOrThrow('BAYSE_PUBLIC_KEY');
   return {
-    'Content-Type': 'application/json',
-    'X-Public-Key': publicKey,
+    'X-Public-Key': getEnvOrThrow('BAYSE_PUBLIC_KEY'),
   };
 }
 
 export function buildWriteHeaders(method, path, body) {
   const publicKey = getEnvOrThrow('BAYSE_PUBLIC_KEY');
   const secretKey = getEnvOrThrow('BAYSE_SECRET_KEY');
-
-  const timestamp = String(Date.now());
+  const requestTimestamp = String(Math.floor(Date.now() / 1000));
+  const upperMethod = method.toUpperCase();
   const bodyHash = hashBody(body);
-  const payload = `${timestamp}.${method.toUpperCase()}.${path}.${bodyHash}`;
+  const payload = `${requestTimestamp}.${upperMethod}.${path}.${bodyHash}`;
 
   const signature = crypto
     .createHmac('sha256', secretKey)
@@ -39,7 +37,7 @@ export function buildWriteHeaders(method, path, body) {
   return {
     'Content-Type': 'application/json',
     'X-Public-Key': publicKey,
-    'X-Timestamp': timestamp,
+    'X-Timestamp': requestTimestamp,
     'X-Signature': signature,
   };
 }
