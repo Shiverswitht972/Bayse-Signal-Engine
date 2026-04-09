@@ -129,11 +129,11 @@ function computeVolumeScore(candles, momentumScore) {
   return clamp(trend * directional, -1, 1);
 }
 
-async function fetchQuoteFeeRatio(eventId, marketId) {
+async function fetchQuoteFeeRatio(eventId, marketId, outcomeId) {
   const path = `/v1/pm/events/${eventId}/markets/${marketId}/quote`;
   const bodyObj = {
     side: 'BUY',
-    outcome: 'YES',
+    outcomeId,
     amount: QUOTE_FEE_PROBE_AMOUNT,
     currency: CURRENCY,
   };
@@ -161,7 +161,6 @@ async function fetchQuoteFeeRatio(eventId, marketId) {
 
   if (feeAmount <= 0) return 0;
 
-  // Convert absolute fee paid for probe amount into a probability/edge-equivalent ratio.
   return feeAmount / QUOTE_FEE_PROBE_AMOUNT;
 }
 
@@ -178,20 +177,35 @@ export async function generateSignal(state) {
 
   const rawEdge = pUp - yesPrice;
 
+  // Determine direction first so we probe the correct outcome
+  const direction = pUp >= 0.5 ? 'YES' : 'NO';
+  const outcomeId = direction === 'YES'
+    ? (state.outcome1Id ?? state.yesOutcomeId)
+    : (state.outcome2Id ?? state.noOutcomeId);
+
   let feeRatio;
   try {
-    feeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId);
+    if (!outcomeId) {
+      // No outcomeId yet — use conservative fallback fee
+      feeRatio = 0.05;
+    } else {
+      feeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId, outcomeId);
+    }
   } catch (error) {
-    return {
-      shouldTrade: false,
-      direction: null,
-      pUp,
-      netEdge: 0,
-      confidence: 0,
-      stake: 0,
-      reason: `Could not fetch quote fee: ${error.message}`,
-      delta5m,
-    };
+    if (error.message.includes('no liquidity')) {
+      feeRatio = 0.05;
+    } else {
+      return {
+        shouldTrade: false,
+        direction: null,
+        pUp,
+        netEdge: 0,
+        confidence: 0,
+        stake: 0,
+        reason: `Could not fetch quote fee: ${error.message}`,
+        delta5m,
+      };
+    }
   }
 
   const netEdge = rawEdge - feeRatio;
@@ -205,7 +219,6 @@ export async function generateSignal(state) {
     threshold -= 0.05;
   }
 
-  const direction = pUp >= 0.5 ? 'YES' : 'NO';
   const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
   const directionalEdge =
     direction === 'YES' ? netEdge : -(pUp - yesPrice) - feeRatio;
@@ -224,6 +237,7 @@ export async function generateSignal(state) {
   return {
     shouldTrade,
     direction: shouldTrade ? direction : null,
+    outcomeId: shouldTrade ? outcomeId : null,
     pUp,
     netEdge: directionalEdge,
     confidence: compositeScore,
