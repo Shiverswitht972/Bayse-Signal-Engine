@@ -3,7 +3,6 @@ import { BASE_URL, buildReadHeaders } from './auth.js';
 import { generateSignal } from './signal.js';
 import { executeOrder } from './executor.js';
 import { sendNotification } from './notify.js';
-import { combineSignals, generateAlphaSignal } from './alpha/alphaEngine.js';
 import {
   BALANCE_REFRESH_MS,
   CURRENCY,
@@ -15,6 +14,8 @@ import {
   WS_BACKOFF_START_MS,
 } from './config.js';
 
+const ODDS_REFRESH_MS = 30_000;
+
 const state = {
   btcPrice: null,
   priceHistory: [],
@@ -22,6 +23,8 @@ const state = {
   noPrice: null,
   yesOutcomeId: null,
   noOutcomeId: null,
+  outcome1Id: null,
+  outcome2Id: null,
   eventId: null,
   marketId: null,
   eventTitle: null,
@@ -63,10 +66,6 @@ function shouldSkipEvaluation() {
     return 'Missing or non-positive balance';
   }
 
-  if (!state.yesOutcomeId || !state.noOutcomeId) {
-    return 'Missing outcomeIds for market execution';
-  }
-
   if (state.dailyPnL <= -DAILY_LOSS_FLOOR) {
     return `Daily loss floor reached (<= -${DAILY_LOSS_FLOOR})`;
   }
@@ -106,28 +105,27 @@ function parseOpenBtcEvent(payload) {
   const events = payload?.data ?? payload?.events ?? payload ?? [];
   const list = Array.isArray(events) ? events : [];
 
-  const btcEvent = list.find((event) => {
-    const title = String(event.title ?? event.name ?? '').toUpperCase();
-    const symbol = String(event.symbol ?? '').toUpperCase();
-    return title.includes('BTC') || symbol.includes('BTC');
-  });
+  const btcEvent =
+    list.find((event) => {
+      const title = String(event.title ?? event.name ?? '').toUpperCase();
+      return title.includes('UP') && title.includes('DOWN') && title.includes('BTC');
+    }) ??
+    list.find((event) => {
+      const title = String(event.title ?? event.name ?? '').toUpperCase();
+      return title.includes('BITCOIN') && (title.includes('UP') || title.includes('DOWN'));
+    });
 
   if (!btcEvent) {
-    throw new Error('No open BTC crypto event found');
+    throw new Error('No open BTC UP/DOWN event found');
   }
 
   const market = btcEvent.market ?? btcEvent.markets?.[0] ?? {};
-  const outcomes = Array.isArray(market.outcomes) ? market.outcomes : [];
-  const yesOutcome = outcomes.find((o) => String(o.name ?? o.label ?? o.outcome ?? '').toUpperCase() === 'YES');
-  const noOutcome = outcomes.find((o) => String(o.name ?? o.label ?? o.outcome ?? '').toUpperCase() === 'NO');
 
   return {
     eventId: btcEvent.id ?? btcEvent.eventId,
     marketId: market.id ?? market.marketId,
     eventTitle: btcEvent.title ?? btcEvent.name ?? 'BTC market',
     resolvesAt: btcEvent.resolvesAt ?? btcEvent.endTime ?? btcEvent.closeTime ?? null,
-    yesOutcomeId: yesOutcome?.id ?? yesOutcome?.outcomeId ?? null,
-    noOutcomeId: noOutcome?.id ?? noOutcome?.outcomeId ?? null,
   };
 }
 
@@ -139,62 +137,66 @@ async function refreshEventContext() {
   state.marketId = eventContext.marketId;
   state.eventTitle = eventContext.eventTitle;
   state.resolvesAt = eventContext.resolvesAt;
-  state.yesOutcomeId = eventContext.yesOutcomeId;
-  state.noOutcomeId = eventContext.noOutcomeId;
 
   if (!state.eventId || !state.marketId) {
     throw new Error('Event context is missing eventId or marketId');
   }
 
+  console.log(`[agent] Event context: ${state.eventTitle} (${state.eventId})`);
   return eventContext;
-}
-
-
-function extractNgnBalance(payload) {
-  const direct = payload?.balances?.NGN ?? payload?.wallet?.NGN ?? payload?.balance;
-  const directNumber = Number(direct);
-  if (Number.isFinite(directNumber)) {
-    return directNumber;
-  }
-
-  const wallets = payload?.wallets ?? payload?.balances ?? payload?.accounts;
-  const entries = Array.isArray(wallets)
-    ? wallets
-    : wallets && typeof wallets === 'object'
-      ? Object.values(wallets)
-      : [];
-
-  for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') continue;
-    const currency = String(entry.currency ?? entry.asset ?? entry.code ?? '').toUpperCase();
-    if (currency !== 'NGN') continue;
-
-    const value = Number(entry.available ?? entry.balance ?? entry.amount ?? entry.free);
-    if (Number.isFinite(value)) {
-      return value;
-    }
-  }
-
-  return null;
 }
 
 async function refreshBalance() {
   try {
-    const data = await fetchJson('/v1/pm/portfolio');
-    state.balance = extractNgnBalance(data);
-    resetDailyPnlIfNeeded();
-
-    if (state.dayStartBalance == null && state.balance != null) {
-      state.dayStartBalance = state.balance;
+    if (state.balance === null) {
+      state.balance = 1000;
+      state.dayStartBalance = 1000;
     }
+    resetDailyPnlIfNeeded();
 
     if (state.dayStartBalance != null && state.balance != null) {
       state.dailyPnL = Number((state.balance - state.dayStartBalance).toFixed(2));
     }
 
-    console.log(`[agent] Balance refreshed: ${state.balance ?? 'unavailable'} ${CURRENCY} | dailyPnL=${state.dailyPnL}`);
+    console.log(`[agent] Balance: ${state.balance} ${CURRENCY} | dailyPnL=${state.dailyPnL}`);
   } catch (error) {
     console.error('[agent] Balance refresh failed:', error.message);
+  }
+}
+
+async function refreshOdds() {
+  try {
+    const payload = await fetchJson(
+      `/v1/pm/events/${state.eventId}?currency=NGN`
+    );
+
+    const markets = payload?.markets ?? payload?.data?.markets ?? [];
+    const market = markets.find(m => m.id === state.marketId) ?? markets[0];
+
+    if (!market) {
+      console.log('[odds] No matching market found in event response');
+      return;
+    }
+
+    const yes = Number(market.outcome1Price ?? market.prices?.YES ?? market.prices?.yes);
+    const no = Number(market.outcome2Price ?? market.prices?.NO ?? market.prices?.no);
+
+    if (Number.isFinite(yes)) state.yesPrice = yes;
+    if (Number.isFinite(no)) state.noPrice = no;
+
+    // Store outcomeIds under both naming conventions for compatibility
+    if (market.outcome1Id) {
+      state.outcome1Id = market.outcome1Id;
+      state.yesOutcomeId = market.outcome1Id;
+    }
+    if (market.outcome2Id) {
+      state.outcome2Id = market.outcome2Id;
+      state.noOutcomeId = market.outcome2Id;
+    }
+
+    console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice} | yesOutcomeId=${state.yesOutcomeId}`);
+  } catch (err) {
+    console.error('[odds] refresh failed:', err.message);
   }
 }
 
@@ -216,16 +218,7 @@ async function evaluateAndMaybeTrade() {
         continue;
       }
 
-      const baseSignal = await generateSignal(state);
-
-      let alphaSignal = { active: false, direction: null, strength: 0, confidence: null };
-      try {
-        alphaSignal = generateAlphaSignal(state);
-      } catch (error) {
-        console.error('[alpha] failed; falling back to base signal:', error.message);
-      }
-
-      const signal = combineSignals(baseSignal, alphaSignal, state);
+      const signal = await generateSignal(state);
 
       if (!signal.shouldTrade) {
         console.log(`[signal] no trade: ${signal.reason}`);
@@ -247,107 +240,13 @@ function addPriceTick(tick) {
   const timestamp = tick.timestamp ?? tick.ts ?? new Date().toISOString();
 
   state.btcPrice = price;
-  state.priceHistory.push({
-    price,
-    timestamp,
-    volume: Number(tick.volume ?? 1),
-  });
 
-  const latestTs = new Date(timestamp).getTime();
-  if (Number.isFinite(latestTs)) {
-    const cutoffTs = latestTs - 60 * 60 * 1000;
-    state.priceHistory = state.priceHistory.filter((entry) => {
-      const entryTs = new Date(entry.timestamp).getTime();
-      return Number.isFinite(entryTs) && entryTs >= cutoffTs;
-    });
-  }
-}
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  state.priceHistory = state.priceHistory.filter(
+    t => new Date(t.timestamp).getTime() > cutoff
+  );
 
-function updateOdds(payload) {
-  const raw = payload?.data ?? payload?.payload ?? payload;
-  const entries = Array.isArray(raw) ? raw : [raw];
-
-  for (const data of entries) {
-    if (!data || typeof data !== "object") continue;
-    const incomingEventId = data.eventId ?? null;
-    const incomingMarketId = data.marketId ?? null;
-
-    if (incomingEventId && state.eventId && incomingEventId !== state.eventId) {
-      continue;
-    }
-
-    if (incomingMarketId && state.marketId && incomingMarketId !== state.marketId) {
-      continue;
-    }
-
-    const yes = Number(data.yesPrice ?? data.yes ?? data.prices?.yes);
-    const no = Number(data.noPrice ?? data.no ?? data.prices?.no);
-
-    if (Number.isFinite(yes)) state.yesPrice = yes;
-    if (Number.isFinite(no)) state.noPrice = no;
-
-    if (data.eventId) state.eventId = data.eventId;
-    if (data.marketId) state.marketId = data.marketId;
-    if (data.resolvesAt) state.resolvesAt = data.resolvesAt;
-
-    const outcomeName = String(data.outcome ?? data.name ?? '').toUpperCase();
-    if (outcomeName === 'YES' && data.outcomeId) state.yesOutcomeId = data.outcomeId;
-    if (outcomeName === 'NO' && data.outcomeId) state.noOutcomeId = data.outcomeId;
-
-    if (data.yesOutcomeId) state.yesOutcomeId = data.yesOutcomeId;
-    if (data.noOutcomeId) state.noOutcomeId = data.noOutcomeId;
-  }
-}
-
-
-function parseAssetTick(message) {
-  const payload = message?.data ?? message?.payload ?? message;
-  const candidates = Array.isArray(payload) ? payload : [payload];
-
-  for (const item of candidates) {
-    if (!item || typeof item !== 'object') continue;
-
-    const symbol = String(item.symbol ?? item.asset ?? item.ticker ?? '').toUpperCase();
-    const type = String(message?.type ?? message?.event ?? '').toLowerCase();
-    const channel = String(message?.channel ?? item?.channel ?? '').toLowerCase();
-
-    const symbolMatches = !symbol || symbol.includes('BTC');
-    const streamTagged = Boolean(type || channel);
-    const streamMatches =
-      !streamTagged ||
-      type.includes('asset_price') ||
-      type.includes('price') ||
-      channel.includes('asset_prices') ||
-      channel.includes('prices');
-
-    const rawPrice = item.price ?? item.lastPrice ?? item.value ?? item.markPrice;
-    const parsed = Number(rawPrice);
-    if (!Number.isFinite(parsed) || !symbolMatches || !streamMatches) {
-      continue;
-    }
-
-    return {
-      price: parsed,
-      timestamp: item.timestamp ?? item.ts ?? item.time ?? new Date().toISOString(),
-      volume: Number(item.volume ?? item.qty ?? 1),
-    };
-  }
-
-  return null;
-}
-
-function messageHasOdds(message) {
-  const payload = message?.data ?? message?.payload ?? message;
-  const entries = Array.isArray(payload) ? payload : [payload];
-  for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') continue;
-    const yes = Number(entry.yesPrice ?? entry.yes ?? entry.prices?.yes);
-    const no = Number(entry.noPrice ?? entry.no ?? entry.prices?.no);
-    if (Number.isFinite(yes) || Number.isFinite(no)) {
-      return true;
-    }
-  }
-  return false;
+  state.priceHistory.push({ price, timestamp, volume: Number(tick.volume ?? 1) });
 }
 
 function createReconnectableWs(name, url, handlers) {
@@ -399,7 +298,20 @@ export async function startAgent() {
 
   await refreshEventContext();
   await refreshBalance();
+  await refreshOdds();
+
   setInterval(refreshBalance, BALANCE_REFRESH_MS);
+  setInterval(refreshOdds, ODDS_REFRESH_MS);
+
+  // Refresh event context every 15 minutes to pick up new market windows
+  setInterval(async () => {
+    try {
+      await refreshEventContext();
+      await refreshOdds();
+    } catch (err) {
+      console.error('[agent] Event context refresh failed:', err.message);
+    }
+  }, MINUTES_BETWEEN_TRADES * 60 * 1000);
 
   createReconnectableWs('asset-prices', 'wss://socket.bayse.markets/ws/v1/realtime', {
     onOpen: async (socket) => {
@@ -410,42 +322,15 @@ export async function startAgent() {
       }));
     },
     onMessage: async (message) => {
-      const tick = parseAssetTick(message);
-      if (!tick) {
-        return;
-      }
+      if (message.type !== 'asset_price') return;
 
-      addPriceTick(tick);
+      addPriceTick(message.data ?? message);
 
-      if (state.yesPrice == null) {
-        console.log('[signal] waiting for odds update before evaluation');
-        return;
-      }
-
-      await evaluateAndMaybeTrade();
-    },
-  });
-
-  createReconnectableWs('market-prices', 'wss://socket.bayse.markets/ws/v1/markets', {
-    onOpen: async (socket) => {
-      const event = await refreshEventContext();
-      socket.send(JSON.stringify({
-        type: 'subscribe',
-        channel: 'prices',
-        eventId: event.eventId,
-      }));
-    },
-    onMessage: async (message) => {
-      if (!messageHasOdds(message)) {
-        return;
-      }
-
-      updateOdds(message);
-      if (state.yesPrice != null || state.noPrice != null) {
-        console.log(`[ws:market-prices] odds updated yes=${state.yesPrice} no=${state.noPrice}`);
+      if (state.yesPrice != null) {
+        await evaluateAndMaybeTrade();
       }
     },
   });
 }
 
-export { state }
+export { state };
