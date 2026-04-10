@@ -181,8 +181,21 @@ async function refreshOdds() {
     const yes = Number(market.outcome1Price ?? market.prices?.YES ?? market.prices?.yes);
     const no = Number(market.outcome2Price ?? market.prices?.NO ?? market.prices?.no);
 
-    if (Number.isFinite(yes)) state.yesPrice = yes;
-    if (Number.isFinite(no)) state.noPrice = no;
+if (Number.isFinite(yes) && yes > 0) state.yesPrice = yes;
+if (Number.isFinite(no) && no > 0) state.noPrice = no;
+
+// If odds are zero the market window has closed — refresh context immediately
+if (yes === 0 && no === 0) {
+  console.log('[odds] Market window closed, refreshing event context...');
+  state.yesPrice = null;
+  state.noPrice = null;
+  try {
+    await refreshEventContext();
+  } catch (err) {
+    console.log('[odds] No new market window open yet, will retry in 30s');
+  }
+  return;
+}
 
     // Store outcomeIds under both naming conventions for compatibility
     if (market.outcome1Id) {
