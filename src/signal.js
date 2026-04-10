@@ -261,3 +261,4 @@ export async function generateSignal(state) {
   console.log(`[alpha] active=${alphaSignal.active} dir=${alphaSignal.direction} strength=${alphaSignal.strength?.toFixed(4) ?? 'n/a'}`);
 
   return combineSignals(baseSignal, alphaSignal, state);
+}
