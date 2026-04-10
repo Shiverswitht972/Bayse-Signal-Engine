@@ -1,5 +1,6 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
 import { getCandles } from './candles.js';
+import { generateAlphaSignal, combineSignals } from './alpha.js';
 import {
   CURRENCY,
   KELLY_FRACTION,
@@ -234,7 +235,7 @@ export async function generateSignal(state) {
   const shouldTrade =
     compositeScore > threshold && directionalEdge > 0 && hasMinimumBalanceForStake;
 
-  return {
+  const baseSignal = {
     shouldTrade,
     direction: shouldTrade ? direction : null,
     outcomeId: shouldTrade ? outcomeId : null,
@@ -249,4 +250,14 @@ export async function generateSignal(state) {
         : `Insufficient balance for minimum stake (${MIN_STAKE_NGN} ${CURRENCY})`,
     delta5m,
   };
-}
+
+  let alphaSignal = { active: false, direction: null, strength: 0, confidence: null };
+  try {
+    alphaSignal = generateAlphaSignal(state);
+  } catch (err) {
+    // alpha is fail-safe — ignore errors
+  }
+
+  console.log(`[alpha] active=${alphaSignal.active} dir=${alphaSignal.direction} strength=${alphaSignal.strength?.toFixed(4) ?? 'n/a'}`);
+
+  return combineSignals(baseSignal, alphaSignal, state);
