@@ -148,22 +148,30 @@ async function refreshEventContext() {
 
 async function refreshBalance() {
   try {
-    if (state.balance === null) {
-      state.balance = 1000;
-      state.dayStartBalance = 1000;
+    const data = await fetchJson('/v1/wallet/assets');
+    const assets = data?.assets ?? [];
+    const ngnAsset = assets.find(a => a.symbol === 'NGN');
+    const balance = ngnAsset ? Number(ngnAsset.availableBalance) : null;
+
+    if (Number.isFinite(balance)) {
+      state.balance = balance;
     }
+
     resetDailyPnlIfNeeded();
+
+    if (state.dayStartBalance == null && state.balance != null) {
+      state.dayStartBalance = state.balance;
+    }
 
     if (state.dayStartBalance != null && state.balance != null) {
       state.dailyPnL = Number((state.balance - state.dayStartBalance).toFixed(2));
     }
 
-    console.log(`[agent] Balance: ${state.balance} ${CURRENCY} | dailyPnL=${state.dailyPnL}`);
+    console.log(`[agent] Balance: ${state.balance ?? 'unavailable'} ${CURRENCY} | dailyPnL=${state.dailyPnL}`);
   } catch (error) {
     console.error('[agent] Balance refresh failed:', error.message);
   }
 }
-
 async function refreshOdds() {
   try {
     const payload = await fetchJson(
