@@ -3,6 +3,7 @@ import { BASE_URL, buildReadHeaders } from './auth.js';
 import { generateSignal } from './signal.js';
 import { executeOrder } from './executor.js';
 import { sendNotification } from './notify.js';
+import { isInExpiryDeadZone } from './utils/expiryDeadZone.js';
 import {
   BALANCE_REFRESH_MS,
   CURRENCY,
@@ -29,6 +30,7 @@ const state = {
   marketId: null,
   eventTitle: null,
   resolvesAt: null,
+  openingPrice: null,
   balance: null,
   lastTradeAt: null,
   dailyPnL: 0,
@@ -40,6 +42,7 @@ export { getCandles } from './candles.js';
 
 let isEvaluatingSignal = false;
 let pendingEvaluation = false;
+let previousEventId = null;
 
 function resetDailyPnlIfNeeded() {
   const utcDate = new Date().toISOString().slice(0, 10);
@@ -78,6 +81,20 @@ function shouldSkipEvaluation() {
     const elapsedMs = Date.now() - new Date(state.lastTradeAt).getTime();
     if (elapsedMs < MINUTES_BETWEEN_TRADES * 60 * 1000) {
       return `Last trade was placed less than ${MINUTES_BETWEEN_TRADES} minutes ago`;
+    }
+  }
+
+  // Expiry dead zone — price too close to line with under 2 minutes left
+  if (state.btcPrice && state.resolvesAt && state.openingPrice) {
+    if (isInExpiryDeadZone(
+      new Date(state.resolvesAt).getTime(),
+      state.btcPrice,
+      state.openingPrice
+    )) {
+      const secsLeft   = Math.round((new Date(state.resolvesAt).getTime() - Date.now()) / 1000);
+      const priceDelta = Math.abs(state.btcPrice - state.openingPrice).toFixed(2);
+      console.warn(`[DEAD ZONE] Skipped — ${secsLeft}s to expiry, price $${priceDelta} from line`);
+      return 'Expiry dead zone — too close to line near resolution';
     }
   }
 
@@ -133,6 +150,13 @@ async function refreshEventContext() {
   const payload = await fetchJson('/v1/pm/events?category=crypto&status=open');
   const eventContext = parseOpenBtcEvent(payload);
 
+  // Detect new market window and capture opening price
+  if (eventContext.eventId !== previousEventId) {
+    state.openingPrice = state.btcPrice;
+    previousEventId = eventContext.eventId;
+    console.log(`[agent] New market window detected — opening price: $${state.openingPrice}`);
+  }
+
   state.eventId = eventContext.eventId;
   state.marketId = eventContext.marketId;
   state.eventTitle = eventContext.eventTitle;
@@ -172,6 +196,7 @@ async function refreshBalance() {
     console.error('[agent] Balance refresh failed:', error.message);
   }
 }
+
 async function refreshOdds() {
   try {
     const payload = await fetchJson(
@@ -189,21 +214,21 @@ async function refreshOdds() {
     const yes = Number(market.outcome1Price ?? market.prices?.YES ?? market.prices?.yes);
     const no = Number(market.outcome2Price ?? market.prices?.NO ?? market.prices?.no);
 
-if (Number.isFinite(yes) && yes > 0) state.yesPrice = yes;
-if (Number.isFinite(no) && no > 0) state.noPrice = no;
+    if (Number.isFinite(yes) && yes > 0) state.yesPrice = yes;
+    if (Number.isFinite(no) && no > 0) state.noPrice = no;
 
-// If odds are zero the market window has closed — refresh context immediately
-if (yes === 0 && no === 0) {
-  console.log('[odds] Market window closed, refreshing event context...');
-  state.yesPrice = null;
-  state.noPrice = null;
-  try {
-    await refreshEventContext();
-  } catch (err) {
-    console.log('[odds] No new market window open yet, will retry in 30s');
-  }
-  return;
-}
+    // If odds are zero the market window has closed — refresh context immediately
+    if (yes === 0 && no === 0) {
+      console.log('[odds] Market window closed, refreshing event context...');
+      state.yesPrice = null;
+      state.noPrice = null;
+      try {
+        await refreshEventContext();
+      } catch (err) {
+        console.log('[odds] No new market window open yet, will retry in 30s');
+      }
+      return;
+    }
 
     // Store outcomeIds under both naming conventions for compatibility
     if (market.outcome1Id) {
