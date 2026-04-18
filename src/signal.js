@@ -178,7 +178,6 @@ export async function generateSignal(state) {
 
   const rawEdge = pUp - yesPrice;
 
-  // Determine direction first so we probe the correct outcome
   const direction = pUp >= 0.5 ? 'YES' : 'NO';
   const outcomeId = direction === 'YES'
     ? (state.outcome1Id ?? state.yesOutcomeId)
@@ -187,7 +186,6 @@ export async function generateSignal(state) {
   let feeRatio;
   try {
     if (!outcomeId) {
-      // No outcomeId yet — use conservative fallback fee
       feeRatio = 0.05;
     } else {
       feeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId, outcomeId);
@@ -219,6 +217,11 @@ export async function generateSignal(state) {
   if (Math.abs(delta5m) > 0.5) {
     threshold -= 0.05;
   }
+
+  // Detail log — shows exactly what each layer is contributing
+  console.log(
+    `[signal:detail] odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`
+  );
 
   const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
   const directionalEdge =
