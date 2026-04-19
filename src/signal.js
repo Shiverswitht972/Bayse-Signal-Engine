@@ -167,48 +167,68 @@ async function fetchQuoteFeeRatio(eventId, marketId, outcomeId) {
 
 export async function generateSignal(state) {
   const yesPrice = Number(state.yesPrice);
-  const marketImpliedP = clamp(yesPrice, 0, 1);
 
   const candles = getCandles(state.priceHistory);
   const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
   const volumeScore = computeVolumeScore(candles, momentumScore);
 
+  // Pure model estimate — independent of market odds
+  // Only blend market price when momentum or volume signals are present
   const modelP = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
-  const pUp = clamp(modelP * 0.7 + marketImpliedP * 0.3, 0, 1);
+  const hasSignal = Math.abs(momentumScore) > 0.1 || Math.abs(volumeScore) > 0.1;
+  const pUp = hasSignal
+    ? clamp(modelP * 0.7 + yesPrice * 0.3, 0, 1)
+    : modelP;
 
-  const rawEdge = pUp - yesPrice;
+  // Evaluate edge on both sides independently
+  const yesEdgeRaw = pUp - yesPrice;
+  const noEdgeRaw = (1 - pUp) - (1 - yesPrice);
 
-  const direction = pUp >= 0.5 ? 'YES' : 'NO';
-  const outcomeId = direction === 'YES'
-    ? (state.outcome1Id ?? state.yesOutcomeId)
-    : (state.outcome2Id ?? state.noOutcomeId);
+  const yesOutcomeId = state.outcome1Id ?? state.yesOutcomeId;
+  const noOutcomeId = state.outcome2Id ?? state.noOutcomeId;
 
-  let feeRatio;
+  // Fetch fees for both sides
+  let yesFeeRatio = 0.05;
+  let noFeeRatio = 0.05;
+
   try {
-    if (!outcomeId) {
-      feeRatio = 0.05;
-    } else {
-      feeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId, outcomeId);
+    if (yesOutcomeId) {
+      yesFeeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId, yesOutcomeId);
     }
-  } catch (error) {
-    if (error.message.includes('no liquidity')) {
-      feeRatio = 0.05;
-    } else {
+  } catch (e) {
+    if (!e.message.includes('no liquidity')) {
       return {
-        shouldTrade: false,
-        direction: null,
-        pUp,
-        netEdge: 0,
-        confidence: 0,
-        stake: 0,
-        reason: `Could not fetch quote fee: ${error.message}`,
-        delta5m,
+        shouldTrade: false, direction: null, pUp,
+        netEdge: 0, confidence: 0, stake: 0,
+        reason: `Quote fee error YES: ${e.message}`, delta5m,
       };
     }
   }
 
-  const netEdge = rawEdge - feeRatio;
-  const oddsDivergence = clamp(netEdge, -1, 1);
+  try {
+    if (noOutcomeId) {
+      noFeeRatio = await fetchQuoteFeeRatio(state.eventId, state.marketId, noOutcomeId);
+    }
+  } catch (e) {
+    if (!e.message.includes('no liquidity')) {
+      return {
+        shouldTrade: false, direction: null, pUp,
+        netEdge: 0, confidence: 0, stake: 0,
+        reason: `Quote fee error NO: ${e.message}`, delta5m,
+      };
+    }
+  }
+
+  const netYesEdge = yesEdgeRaw - yesFeeRatio;
+  const netNoEdge = noEdgeRaw - noFeeRatio;
+
+  // Pick the side with stronger positive edge
+  const direction = netYesEdge >= netNoEdge ? 'YES' : 'NO';
+  const outcomeId = direction === 'YES' ? yesOutcomeId : noOutcomeId;
+  const directionalEdge = direction === 'YES' ? netYesEdge : netNoEdge;
+  const feeRatio = direction === 'YES' ? yesFeeRatio : noFeeRatio;
+
+  const oddsDivergence = clamp(directionalEdge, -1, 1);
 
   const compositeScore =
     oddsDivergence * 0.4 + momentumScore * 0.35 + volumeScore * 0.25;
@@ -218,14 +238,11 @@ export async function generateSignal(state) {
     threshold -= 0.05;
   }
 
-  // Detail log — shows exactly what each layer is contributing
   console.log(
-    `[signal:detail] odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`
+    `[signal:detail] yes_edge=${netYesEdge.toFixed(3)} no_edge=${netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`
   );
 
   const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
-  const directionalEdge =
-    direction === 'YES' ? netEdge : -(pUp - yesPrice) - feeRatio;
 
   const kelly = pricedSide > 0 ? directionalEdge / pricedSide : 0;
   const rawStake = kelly * state.balance * KELLY_FRACTION;
