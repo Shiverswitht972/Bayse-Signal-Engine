@@ -84,14 +84,13 @@ function shouldSkipEvaluation() {
     }
   }
 
-  // Expiry dead zone — price too close to line with under 2 minutes left
   if (state.btcPrice && state.resolvesAt && state.openingPrice) {
     if (isInExpiryDeadZone(
       new Date(state.resolvesAt).getTime(),
       state.btcPrice,
       state.openingPrice
     )) {
-      const secsLeft   = Math.round((new Date(state.resolvesAt).getTime() - Date.now()) / 1000);
+      const secsLeft = Math.round((new Date(state.resolvesAt).getTime() - Date.now()) / 1000);
       const priceDelta = Math.abs(state.btcPrice - state.openingPrice).toFixed(2);
       console.warn(`[DEAD ZONE] Skipped — ${secsLeft}s to expiry, price $${priceDelta} from line`);
       return 'Expiry dead zone — too close to line near resolution';
@@ -150,7 +149,6 @@ async function refreshEventContext() {
   const payload = await fetchJson('/v1/pm/events?category=crypto&status=open');
   const eventContext = parseOpenBtcEvent(payload);
 
-  // Detect new market window and capture opening price
   if (eventContext.eventId !== previousEventId) {
     state.openingPrice = state.btcPrice;
     previousEventId = eventContext.eventId;
@@ -217,7 +215,6 @@ async function refreshOdds() {
     if (Number.isFinite(yes) && yes > 0) state.yesPrice = yes;
     if (Number.isFinite(no) && no > 0) state.noPrice = no;
 
-    // If odds are zero the market window has closed — refresh context immediately
     if (yes === 0 && no === 0) {
       console.log('[odds] Market window closed, refreshing event context...');
       state.yesPrice = null;
@@ -230,7 +227,6 @@ async function refreshOdds() {
       return;
     }
 
-    // Store outcomeIds under both naming conventions for compatibility
     if (market.outcome1Id) {
       state.outcome1Id = market.outcome1Id;
       state.yesOutcomeId = market.outcome1Id;
@@ -272,6 +268,13 @@ async function evaluateAndMaybeTrade() {
       }
 
       const result = await executeOrder(signal, state);
+
+      // Suppress notification on liquidity failures — no spam
+      if (!result.success && result.reason?.includes('no liquidity')) {
+        console.log('[executor] No liquidity — skipping notification');
+        continue;
+      }
+
       await sendNotification(signal, result, state);
     } while (pendingEvaluation);
   } finally {
@@ -349,7 +352,6 @@ export async function startAgent() {
   setInterval(refreshBalance, BALANCE_REFRESH_MS);
   setInterval(refreshOdds, ODDS_REFRESH_MS);
 
-  // Refresh event context every 15 minutes to pick up new market windows
   setInterval(async () => {
     try {
       await refreshEventContext();
