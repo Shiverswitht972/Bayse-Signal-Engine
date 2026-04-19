@@ -33,11 +33,12 @@ export async function executeOrder(signal, state) {
     }
 
     const payload = {
-      side: 'BUY',
-      outcomeId,
-      amount: signal.stake,
-      currency: CURRENCY,
-    };
+  type: 'MARKET',
+  side: 'BUY',
+  outcomeId,
+  amount: signal.stake,
+  currency: CURRENCY,
+};
 
     const quote = await postSigned(`${pathBase}/quote`, payload);
 
