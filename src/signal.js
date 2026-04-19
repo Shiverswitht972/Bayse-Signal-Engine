@@ -172,24 +172,21 @@ export async function generateSignal(state) {
   const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
   const volumeScore = computeVolumeScore(candles, momentumScore);
 
-  // Pure model estimate — independent of market odds
-  // Only blend market price when momentum or volume signals are present
   const modelP = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
   const hasSignal = Math.abs(momentumScore) > 0.1 || Math.abs(volumeScore) > 0.1;
   const pUp = hasSignal
     ? clamp(modelP * 0.7 + yesPrice * 0.3, 0, 1)
     : modelP;
 
-  // Evaluate edge on both sides independently
   const yesEdgeRaw = pUp - yesPrice;
   const noEdgeRaw = (1 - pUp) - (1 - yesPrice);
 
   const yesOutcomeId = state.outcome1Id ?? state.yesOutcomeId;
   const noOutcomeId = state.outcome2Id ?? state.noOutcomeId;
 
-  // Fetch fees for both sides
-  let yesFeeRatio = 0.05;
-  let noFeeRatio = 0.05;
+  // null = no liquidity (untradeable), number = fee ratio
+  let yesFeeRatio = null;
+  let noFeeRatio = null;
 
   try {
     if (yesOutcomeId) {
@@ -203,6 +200,7 @@ export async function generateSignal(state) {
         reason: `Quote fee error YES: ${e.message}`, delta5m,
       };
     }
+    // null stays — YES side has no liquidity
   }
 
   try {
@@ -217,10 +215,21 @@ export async function generateSignal(state) {
         reason: `Quote fee error NO: ${e.message}`, delta5m,
       };
     }
+    // null stays — NO side has no liquidity
   }
 
-  const netYesEdge = yesEdgeRaw - yesFeeRatio;
-  const netNoEdge = noEdgeRaw - noFeeRatio;
+  // If both sides have no liquidity, skip entirely
+  if (yesFeeRatio === null && noFeeRatio === null) {
+    return {
+      shouldTrade: false, direction: null, pUp,
+      netEdge: 0, confidence: 0, stake: 0,
+      reason: 'No liquidity on either side', delta5m,
+    };
+  }
+
+  // Only consider tradeable sides for edge comparison
+  const netYesEdge = yesFeeRatio !== null ? yesEdgeRaw - yesFeeRatio : -Infinity;
+  const netNoEdge = noFeeRatio !== null ? noEdgeRaw - noFeeRatio : -Infinity;
 
   // Pick the side with stronger positive edge
   const direction = netYesEdge >= netNoEdge ? 'YES' : 'NO';
@@ -232,7 +241,6 @@ export async function generateSignal(state) {
   const compositeScore =
     oddsDivergence * 0.4 + momentumScore * 0.35 + volumeScore * 0.25;
 
-  // Dynamic threshold — large odds divergence is primary evidence on its own
   let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
   if (Math.abs(delta5m) > 0.5) threshold -= 0.05;
 
@@ -242,7 +250,7 @@ export async function generateSignal(state) {
   else if (absEdge >= 0.10) threshold -= 0.10;
 
   console.log(
-    `[signal:detail] yes_edge=${netYesEdge.toFixed(3)} no_edge=${netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`
+    `[signal:detail] yes_edge=${netYesEdge === -Infinity ? 'no-liq' : netYesEdge.toFixed(3)} no_edge=${netNoEdge === -Infinity ? 'no-liq' : netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`
   );
 
   const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
