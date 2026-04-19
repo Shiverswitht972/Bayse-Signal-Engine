@@ -233,10 +233,14 @@ export async function generateSignal(state) {
   const compositeScore =
     oddsDivergence * 0.4 + momentumScore * 0.35 + volumeScore * 0.25;
 
-  let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
-  if (Math.abs(delta5m) > 0.5) {
-    threshold -= 0.05;
-  }
+ let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
+if (Math.abs(delta5m) > 0.5) threshold -= 0.05;
+
+// When odds divergence is strong, lower the threshold
+// A large mispricing is itself sufficient evidence — momentum just confirms
+const absEdge = Math.abs(directionalEdge);
+if (absEdge > 0.30) threshold -= 0.15;
+if (absEdge > 0.20) threshold -= 0.10;
 
   console.log(
     `[signal:detail] yes_edge=${netYesEdge.toFixed(3)} no_edge=${netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`
