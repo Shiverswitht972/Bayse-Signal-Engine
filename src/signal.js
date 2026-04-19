@@ -133,11 +133,12 @@ function computeVolumeScore(candles, momentumScore) {
 async function fetchQuoteFeeRatio(eventId, marketId, outcomeId) {
   const path = `/v1/pm/events/${eventId}/markets/${marketId}/quote`;
   const bodyObj = {
-    side: 'BUY',
-    outcomeId,
-    amount: QUOTE_FEE_PROBE_AMOUNT,
-    currency: CURRENCY,
-  };
+  type: 'MARKET',
+  side: 'BUY',
+  outcomeId,
+  amount: QUOTE_FEE_PROBE_AMOUNT,
+  currency: CURRENCY,
+};
   const body = JSON.stringify(bodyObj);
 
   const response = await fetch(`${BASE_URL}${path}`, {
