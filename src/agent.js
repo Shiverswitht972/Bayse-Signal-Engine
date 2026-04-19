@@ -61,6 +61,10 @@ function minutesUntilResolution() {
 }
 
 function shouldSkipEvaluation() {
+  // Never trade when market is too one-sided — no real liquidity and model has no edge
+if (state.yesPrice !== null && (state.yesPrice < 0.10 || state.yesPrice > 0.90)) {
+  return 'Market too one-sided — skipping';
+}
   if (state.priceHistory.length < MIN_HISTORY_POINTS) {
     return 'Not enough price history yet';
   }
