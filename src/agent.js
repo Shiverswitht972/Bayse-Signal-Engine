@@ -267,9 +267,12 @@ async function evaluateAndMaybeTrade() {
         continue;
       }
 
+      // Lock out further attempts for this market window immediately
+      // regardless of whether execution succeeds or fails
+      state.lastTradeAt = new Date().toISOString();
+
       const result = await executeOrder(signal, state);
 
-      // Suppress notification on liquidity failures — no spam
       if (!result.success && result.reason?.includes('no liquidity')) {
         console.log('[executor] No liquidity — skipping notification');
         continue;
@@ -281,7 +284,6 @@ async function evaluateAndMaybeTrade() {
     isEvaluatingSignal = false;
   }
 }
-
 function addPriceTick(tick) {
   const price = Number(tick.price ?? tick.lastPrice ?? tick.value);
   if (!Number.isFinite(price)) return;
