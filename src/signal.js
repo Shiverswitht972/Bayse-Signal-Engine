@@ -239,9 +239,11 @@ export async function generateSignal(state) {
 
   const oddsDivergence = clamp(directionalEdge, -1, 1);
 
-  const compositeScore =
-    oddsDivergence * 0.4 + momentumScore * 0.35 + volumeScore * 0.25;
-
+  const directionMultiplier = direction === 'NO' ? -1 : 1;
+const compositeScore =
+  oddsDivergence * 0.4 +
+  (momentumScore * directionMultiplier) * 0.35 +
+  (volumeScore * directionMultiplier) * 0.25;
   let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
   if (Math.abs(delta5m) > 0.5) threshold -= 0.05;
 
