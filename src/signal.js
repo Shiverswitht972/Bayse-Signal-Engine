@@ -1,11 +1,14 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
 import { getCandles } from './candles.js';
 import { generateAlphaSignal, combineSignals } from './alpha.js';
+import { fetchBTCKlines } from './perception.js';     // ✅ FIX 1: import Binance candles
+import { classifyRegime } from './regime.js';          // ✅ FIX 2: import regime classifier
 import {
   CURRENCY,
   KELLY_FRACTION,
   MAX_STAKE_NGN,
   MIN_STAKE_NGN,
+  REGIME_CANDLE_LIMIT,                                 // ✅ FIX 3: new config constant
 } from './config.js';
 
 const QUOTE_FEE_PROBE_AMOUNT = 100;
@@ -97,7 +100,13 @@ function computeDelta5m(priceHistory) {
   return ((latest.price - baseline.price) / baseline.price) * 100;
 }
 
-function computeMomentum(priceHistory, candles) {
+// ✅ FIX 1: Now accepts binanceCandles as a param — uses them for RSI/MACD
+// Falls back to internal candles only if Binance fetch failed
+function computeMomentum(priceHistory, internalCandles, binanceCandles) {
+  const candles = (binanceCandles && binanceCandles.length >= 35)
+    ? binanceCandles
+    : internalCandles;
+
   const closes = candles.map((c) => c.close);
   const rsi = rsiWilder(closes, 14);
   const macdValues = macd(closes);
@@ -107,6 +116,11 @@ function computeMomentum(priceHistory, candles) {
   const macdScore =
     macdValues == null ? 0 : macdValues.macd > macdValues.signal ? 1 : -1;
   const deltaScore = clamp(delta5m / 1.0, -1, 1);
+
+  // Log which data source was used so you can verify in prod
+  console.log(
+    `[signal:data] source=${candles === binanceCandles ? 'binance' : 'internal'} candles=${candles.length} rsi=${rsi?.toFixed(2) ?? 'null'} macd=${macdValues ? `${macdValues.macd.toFixed(4)}>${macdValues.signal.toFixed(4)}` : 'null'}`,
+  );
 
   const momentumScore = clamp((rsiScore + macdScore + deltaScore) / 3, -1, 1);
 
@@ -133,12 +147,12 @@ function computeVolumeScore(candles, momentumScore) {
 async function fetchQuoteFeeRatio(eventId, marketId, outcomeId) {
   const path = `/v1/pm/events/${eventId}/markets/${marketId}/quote`;
   const bodyObj = {
-  type: 'MARKET',
-  side: 'BUY',
-  outcomeId,
-  amount: QUOTE_FEE_PROBE_AMOUNT,
-  currency: CURRENCY,
-};
+    type: 'MARKET',
+    side: 'BUY',
+    outcomeId,
+    amount: QUOTE_FEE_PROBE_AMOUNT,
+    currency: CURRENCY,
+  };
   const body = JSON.stringify(bodyObj);
 
   const response = await fetch(`${BASE_URL}${path}`, {
@@ -169,15 +183,62 @@ async function fetchQuoteFeeRatio(eventId, marketId, outcomeId) {
 export async function generateSignal(state) {
   const yesPrice = Number(state.yesPrice);
 
-  const candles = getCandles(state.priceHistory);
-  const { momentumScore, delta5m } = computeMomentum(state.priceHistory, candles);
-  const volumeScore = computeVolumeScore(candles, momentumScore);
+  // ── FIX 1: Fetch real Binance candles ─────────────────────────────────────
+  let binanceCandles = null;
+  try {
+    binanceCandles = await fetchBTCKlines(REGIME_CANDLE_LIMIT);
+    console.log(`[signal] Binance candles fetched: ${binanceCandles.length}`);
+  } catch (err) {
+    console.warn(`[signal] Binance fetch failed, falling back to internal candles: ${err.message}`);
+  }
 
+  // ── FIX 2: Regime filter — skip if choppy or flat ─────────────────────────
+  if (binanceCandles && binanceCandles.length >= 30) {
+    let regime;
+    try {
+      regime = classifyRegime(binanceCandles);
+    } catch (err) {
+      console.warn(`[regime] Classification error — proceeding without filter: ${err.message}`);
+      regime = { regime: 'UNKNOWN', reason: err.message };
+    }
+
+    console.log(`[regime] ${regime.regime} — ${regime.reason}`);
+
+    if (regime.regime === 'CHOPPY' || regime.regime === 'FLAT') {
+      return {
+        shouldTrade: false,
+        direction: null,
+        pUp: 0.5,
+        netEdge: 0,
+        confidence: 0,
+        stake: 0,
+        reason: `Regime filter blocked: ${regime.regime} — ${regime.reason}`,
+        delta5m: 0,
+        regime: regime.regime,
+      };
+    }
+  }
+
+  // ── Indicator calculations ─────────────────────────────────────────────────
+  const internalCandles = getCandles(state.priceHistory);
+  const { momentumScore, delta5m } = computeMomentum(
+    state.priceHistory,
+    internalCandles,
+    binanceCandles,
+  );
+
+  // Use Binance candles for volume score if available (more stable)
+  const candlesForVolume = (binanceCandles && binanceCandles.length >= 6)
+    ? binanceCandles
+    : internalCandles;
+  const volumeScore = computeVolumeScore(candlesForVolume, momentumScore);
+
+  // ── FIX 3: Clean model probability — no circular yesPrice anchor ───────────
+  // Before: modelP * 0.7 + yesPrice * 0.3  ← yesPrice polluted your own estimate
+  // After:  pure model output, compared cleanly against yesPrice for edge
   const modelP = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
   const hasSignal = Math.abs(momentumScore) > 0.1 || Math.abs(volumeScore) > 0.1;
-  const pUp = hasSignal
-    ? clamp(modelP * 0.7 + yesPrice * 0.3, 0, 1)
-    : modelP;
+  const pUp = hasSignal ? modelP : 0.5; // No signal = no conviction = 50/50
 
   const yesEdgeRaw = pUp - yesPrice;
   const noEdgeRaw = (1 - pUp) - (1 - yesPrice);
@@ -201,7 +262,6 @@ export async function generateSignal(state) {
         reason: `Quote fee error YES: ${e.message}`, delta5m,
       };
     }
-    // null stays — YES side has no liquidity
   }
 
   try {
@@ -216,10 +276,8 @@ export async function generateSignal(state) {
         reason: `Quote fee error NO: ${e.message}`, delta5m,
       };
     }
-    // null stays — NO side has no liquidity
   }
 
-  // If both sides have no liquidity, skip entirely
   if (yesFeeRatio === null && noFeeRatio === null) {
     return {
       shouldTrade: false, direction: null, pUp,
@@ -228,11 +286,9 @@ export async function generateSignal(state) {
     };
   }
 
-  // Only consider tradeable sides for edge comparison
   const netYesEdge = yesFeeRatio !== null ? yesEdgeRaw - yesFeeRatio : -Infinity;
   const netNoEdge = noFeeRatio !== null ? noEdgeRaw - noFeeRatio : -Infinity;
 
-  // Pick the side with stronger positive edge
   const direction = netYesEdge >= netNoEdge ? 'YES' : 'NO';
   const outcomeId = direction === 'YES' ? yesOutcomeId : noOutcomeId;
   const directionalEdge = direction === 'YES' ? netYesEdge : netNoEdge;
@@ -240,20 +296,24 @@ export async function generateSignal(state) {
   const oddsDivergence = clamp(directionalEdge, -1, 1);
 
   const directionMultiplier = direction === 'NO' ? -1 : 1;
-const compositeScore =
-  oddsDivergence * 0.4 +
-  (momentumScore * directionMultiplier) * 0.35 +
-  (volumeScore * directionMultiplier) * 0.25;
+  const compositeScore =
+    oddsDivergence * 0.4 +
+    (momentumScore * directionMultiplier) * 0.35 +
+    (volumeScore * directionMultiplier) * 0.25;
+
   let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
   if (Math.abs(delta5m) > 0.5) threshold -= 0.05;
 
+  // NOTE: Removed the aggressive threshold collapse on large edges.
+  // Large edges often mean bad inputs, not a strong read.
+  // A modest discount is kept only for genuinely large divergence.
   const absEdge = Math.abs(directionalEdge);
-  if (absEdge >= 0.30) threshold = Math.min(threshold, 0.15);
-  else if (absEdge >= 0.20) threshold = Math.min(threshold, 0.25);
-  else if (absEdge >= 0.10) threshold -= 0.10;
+  if (absEdge >= 0.25) threshold = Math.min(threshold, 0.35); // was 0.15 — tightened
+  else if (absEdge >= 0.15) threshold = Math.min(threshold, 0.45); // was 0.25 — tightened
+  else if (absEdge >= 0.10) threshold -= 0.05;                     // was -0.10 — halved
 
   console.log(
-    `[signal:detail] yes_edge=${netYesEdge === -Infinity ? 'no-liq' : netYesEdge.toFixed(3)} no_edge=${netNoEdge === -Infinity ? 'no-liq' : netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`
+    `[signal:detail] yes_edge=${netYesEdge === -Infinity ? 'no-liq' : netYesEdge.toFixed(3)} no_edge=${netNoEdge === -Infinity ? 'no-liq' : netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`,
   );
 
   const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
