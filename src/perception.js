@@ -75,29 +75,48 @@ export async function fetchBalance() {
   return toNumber(data?.balances?.NGN ?? data?.wallet?.NGN ?? data?.balance ?? 0);
 }
 
-export async function fetchBTCPrice() {
-  // ✅ Swapped to Binance market data mirror — same data, no geo-restriction
-  const response = await fetch(
-    'https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT',
-  );
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`fetchBTCPrice failed (${response.status}): ${errorText}`);
+// ── Binance mirror fallback chain ─────────────────────────────────────────────
+// data-api.binance.vision is the official market data mirror (no eligibility check).
+// api1–api4 are Binance's own regional load balancers — try them in order if the
+// primary mirror is unreachable from this Render node's geographic location.
+const BINANCE_PRICE_HOSTS = [
+  'https://data-api.binance.vision',
+  'https://api1.binance.com',
+  'https://api2.binance.com',
+  'https://api3.binance.com',
+  'https://api4.binance.com',
+];
+
+async function tryBinanceFetch(path) {
+  let lastError;
+  for (const host of BINANCE_PRICE_HOSTS) {
+    try {
+      const response = await fetch(`${host}${path}`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`${response.status}: ${text.slice(0, 120)}`);
+      }
+      console.log(`[perception] Connected via ${host}`);
+      return response;
+    } catch (err) {
+      console.warn(`[perception] ${host} failed: ${err.message.slice(0, 80)}`);
+      lastError = err;
+    }
   }
+  throw new Error(`All Binance mirrors failed. Last error: ${lastError?.message}`);
+}
+
+export async function fetchBTCPrice() {
+  const response = await tryBinanceFetch('/api/v3/ticker/price?symbol=BTCUSDT');
   const data = await response.json();
   return Number.parseFloat(data?.price);
 }
 
 export async function fetchBTCKlines(limit = 20) {
   const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : 20;
-  // ✅ Swapped to Binance market data mirror — same data, no geo-restriction
-  const response = await fetch(
-    `https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=${safeLimit}`,
+  const response = await tryBinanceFetch(
+    `/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=${safeLimit}`,
   );
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`fetchBTCKlines failed (${response.status}): ${errorText}`);
-  }
   const data = await response.json();
   if (!Array.isArray(data)) {
     return [];
