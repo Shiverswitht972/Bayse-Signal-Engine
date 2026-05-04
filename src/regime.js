@@ -9,10 +9,6 @@
  * Minimum 30 candles recommended, 50+ for reliable classification.
  */
 
-/**
- * Wilder-smoothed ATR over a given period.
- * Returns null if there aren't enough candles.
- */
 function computeATR(candles, period = 14) {
   if (candles.length < period + 1) return null;
 
@@ -27,10 +23,7 @@ function computeATR(candles, period = 14) {
     ));
   }
 
-  // Seed with simple average over first `period` TRs
   let atrVal = trueRanges.slice(0, period).reduce((a, b) => a + b, 0) / period;
-
-  // Wilder smoothing for the rest
   for (let i = period; i < trueRanges.length; i++) {
     atrVal = (atrVal * (period - 1) + trueRanges[i]) / period;
   }
@@ -38,10 +31,6 @@ function computeATR(candles, period = 14) {
   return atrVal;
 }
 
-/**
- * Standard EMA over an array of close prices.
- * Returns [] if there aren't enough values.
- */
 function computeEMA(closes, period) {
   if (closes.length < period) return [];
   const k = 2 / (period + 1);
@@ -54,16 +43,9 @@ function computeEMA(closes, period) {
   return result;
 }
 
-/**
- * Measures how much EMA-9 and EMA-21 have crossed/tangled
- * over the last `lookback` candles.
- * Returns the number of crossovers — high count = choppy.
- */
 function countEMACrossovers(ema9, ema21, lookback = 10) {
-  // Align: ema9 always has more values since it uses a shorter period
   const offset = ema9.length - ema21.length;
   const aligned9 = ema9.slice(offset);
-
   const start = Math.max(0, aligned9.length - lookback);
   let crossovers = 0;
 
@@ -77,10 +59,39 @@ function countEMACrossovers(ema9, ema21, lookback = 10) {
 }
 
 /**
+ * Computes MACD direction from closes.
+ * Returns 'UP' if macd line > signal line, 'DOWN' if below, null if insufficient data.
+ */
+function computeMACDDirection(closes) {
+  const emaFn = (values, period) => {
+    if (values.length < period) return [];
+    const k = 2 / (period + 1);
+    let prev = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    const result = [prev];
+    for (let i = period; i < values.length; i++) {
+      prev = values[i] * k + prev * (1 - k);
+      result.push(prev);
+    }
+    return result;
+  };
+
+  const ema12 = emaFn(closes, 12);
+  const ema26 = emaFn(closes, 26);
+  if (ema12.length === 0 || ema26.length === 0) return null;
+
+  const offset = 26 - 12;
+  const macdLine = ema26.map((val, i) => ema12[i + offset] - val);
+  const signalLine = emaFn(macdLine, 9);
+  if (signalLine.length === 0) return null;
+
+  return macdLine.at(-1) > signalLine.at(-1) ? 'UP' : 'DOWN';
+}
+
+/**
  * Main regime classifier.
  *
  * Returns one of:
- *   { regime: 'TRENDING', direction: 'UP'|'DOWN', reason, atrPct, emaSeparation }
+ *   { regime: 'TRENDING', direction: 'UP'|'DOWN', macdDirection: 'UP'|'DOWN'|null, contradicted: bool, reason, atrPct, emaSeparation }
  *   { regime: 'CHOPPY',   reason, atrPct, emaSeparation }
  *   { regime: 'FLAT',     reason, atrPct }
  *   { regime: 'UNKNOWN',  reason }
@@ -90,12 +101,17 @@ function countEMACrossovers(ema9, ema21, lookback = 10) {
  */
 export function classifyRegime(candles, thresholds = {}) {
   const {
-    minCandles        = 30,    // Minimum candles needed
-    flatAtrPct        = 0.0003, // ATR < 0.03% of price = flat market, no edge
-    choppyAtrPct      = 0.0008, // ATR < 0.08% = low conviction, treat as choppy
-    choppySepPct      = 0.0002, // EMA separation < 0.02% = tangled
-    choppySlopePct    = 0.0002, // EMA-9 slope < 0.02% = no directional momentum
-    maxCrossovers     = 3,     // Too many EMA crosses in last 10 candles = choppy
+    minCandles     = 30,
+    flatAtrPct     = 0.0003,  // ATR < 0.03% = flat, no edge
+    choppyAtrPct   = 0.0008,  // ATR < 0.08% = low conviction
+    // ✅ FIX: Raised from 0.0002 to 0.0005 — 0.02% separation was too thin
+    // to call a real trend. At sep=0.021% the old code called TRENDING DOWN
+    // and the engine fired into an 85% YES market and lost. Now requires
+    // 0.05% minimum separation before calling TRENDING.
+    choppySepPct   = 0.0005,
+    // ✅ FIX: Raised slope threshold too for the same reason
+    choppySlopePct = 0.0003,
+    maxCrossovers  = 3,
   } = thresholds;
 
   // ── Guard ──────────────────────────────────────────────────────────────────
@@ -106,7 +122,7 @@ export function classifyRegime(candles, thresholds = {}) {
     };
   }
 
-  const closes      = candles.map(c => c.close);
+  const closes = candles.map(c => c.close);
   const currentPrice = closes.at(-1);
 
   if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
@@ -140,15 +156,12 @@ export function classifyRegime(candles, thresholds = {}) {
   const lastEma9  = ema9.at(-1);
   const lastEma21 = ema21.at(-1);
 
-  // Separation between EMAs as a fraction of price — the "spread"
   const emaSeparation    = (lastEma9 - lastEma21) / currentPrice;
   const absEmaSeparation = Math.abs(emaSeparation);
 
-  // Slope of EMA-9 over last 4 candles as a fraction of price
   const ema9Slope    = (ema9.at(-1) - ema9.at(-5)) / currentPrice;
   const absEma9Slope = Math.abs(ema9Slope);
 
-  // Crossover choppiness check
   const crossovers = countEMACrossovers(ema9, ema21, 10);
 
   const isEMATangled  = absEmaSeparation < choppySepPct;
@@ -156,7 +169,6 @@ export function classifyRegime(candles, thresholds = {}) {
   const isTooChoppy   = crossovers > maxCrossovers;
   const isLowVol      = atrPct < choppyAtrPct;
 
-  // Call it choppy if two or more choppiness signals fire
   const choppinessScore = [isEMATangled, isSlopeFlat, isTooChoppy, isLowVol]
     .filter(Boolean).length;
 
@@ -176,12 +188,24 @@ export function classifyRegime(candles, thresholds = {}) {
   }
 
   // ── Step 3: Confirmed Trend ────────────────────────────────────────────────
-  const direction = emaSeparation > 0 ? 'UP' : 'DOWN';
+  const emaDirection   = emaSeparation > 0 ? 'UP' : 'DOWN';
+
+  // ✅ FIX 2: Compute MACD direction and flag contradictions
+  // If MACD disagrees with EMA trend direction, the trend is unreliable.
+  // signal.js uses this to block trades where indicators conflict.
+  const macdDirection  = computeMACDDirection(closes);
+  const contradicted   = macdDirection !== null && macdDirection !== emaDirection;
+
+  if (contradicted) {
+    console.log(`[regime] TRENDING ${emaDirection} but MACD says ${macdDirection} — flagging contradiction`);
+  }
 
   return {
     regime: 'TRENDING',
-    direction,
-    reason: `Clean ${direction} trend — sep=${(absEmaSeparation * 100).toFixed(4)}% slope=${(ema9Slope * 100).toFixed(4)}% ATR=${(atrPct * 100).toFixed(4)}%`,
+    direction: emaDirection,
+    macdDirection,
+    contradicted,  // ← signal.js checks this before firing
+    reason: `Clean ${emaDirection} trend — sep=${(absEmaSeparation * 100).toFixed(4)}% slope=${(ema9Slope * 100).toFixed(4)}% ATR=${(atrPct * 100).toFixed(4)}%${contradicted ? ` ⚠️ MACD contradiction (${macdDirection})` : ''}`,
     atrPct,
     emaSeparation,
     crossovers,
