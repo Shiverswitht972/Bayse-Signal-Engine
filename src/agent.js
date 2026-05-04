@@ -61,10 +61,14 @@ function minutesUntilResolution() {
 }
 
 function shouldSkipEvaluation() {
-  // Never trade when market is too one-sided — no real liquidity and model has no edge
-if (state.yesPrice !== null && (state.yesPrice < 0.10 || state.yesPrice > 0.90)) {
-  return 'Market too one-sided — skipping';
-}
+  // ✅ FIX 1: Tightened from 0.10/0.90 to 0.15/0.80
+  // When the market prices YES at 80%+ it has strong conviction backed by
+  // real liquidity and participant knowledge. Betting against it with a
+  // momentum model on 1m candles is a low-probability play — skip it.
+  if (state.yesPrice !== null && (state.yesPrice < 0.15 || state.yesPrice > 0.80)) {
+    return `Market too one-sided (yesPrice=${state.yesPrice?.toFixed(2)}) — skipping`;
+  }
+
   if (state.priceHistory.length < MIN_HISTORY_POINTS) {
     return 'Not enough price history yet';
   }
@@ -92,7 +96,7 @@ if (state.yesPrice !== null && (state.yesPrice < 0.10 || state.yesPrice > 0.90))
     if (isInExpiryDeadZone(
       new Date(state.resolvesAt).getTime(),
       state.btcPrice,
-      state.openingPrice
+      state.openingPrice,
     )) {
       const secsLeft = Math.round((new Date(state.resolvesAt).getTime() - Date.now()) / 1000);
       const priceDelta = Math.abs(state.btcPrice - state.openingPrice).toFixed(2);
@@ -202,7 +206,7 @@ async function refreshBalance() {
 async function refreshOdds() {
   try {
     const payload = await fetchJson(
-      `/v1/pm/events/${state.eventId}?currency=NGN`
+      `/v1/pm/events/${state.eventId}?currency=NGN`,
     );
 
     const markets = payload?.markets ?? payload?.data?.markets ?? [];
@@ -288,6 +292,7 @@ async function evaluateAndMaybeTrade() {
     isEvaluatingSignal = false;
   }
 }
+
 function addPriceTick(tick) {
   const price = Number(tick.price ?? tick.lastPrice ?? tick.value);
   if (!Number.isFinite(price)) return;
@@ -298,7 +303,7 @@ function addPriceTick(tick) {
 
   const cutoff = Date.now() - 60 * 60 * 1000;
   state.priceHistory = state.priceHistory.filter(
-    t => new Date(t.timestamp).getTime() > cutoff
+    t => new Date(t.timestamp).getTime() > cutoff,
   );
 
   state.priceHistory.push({ price, timestamp, volume: Number(tick.volume ?? 1) });
