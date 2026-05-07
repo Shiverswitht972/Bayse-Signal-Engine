@@ -99,6 +99,10 @@ function minutesUntilResolution(ms) {
 }
 
 function shouldSkipEvaluation(ms) {
+  if (!ms.eventId || !ms.marketId) {
+    return 'No confirmed event/market ID — between windows or wrong market type';
+  }
+
   if (ms.yesPrice !== null && (ms.yesPrice < 0.15 || ms.yesPrice > 0.80)) {
     return `Market too one-sided (yesPrice=${ms.yesPrice?.toFixed(2)})`;
   }
@@ -173,20 +177,22 @@ async function refreshEventContext(ms) {
 
   const sym = ms.symbol.toUpperCase();
 
-  // Primary: symbol + UP/DOWN in title e.g. "BTC UP/DOWN 15min"
-  // Fallback: symbol anywhere in title
-  const event =
-    list.find(e => {
-      const t = String(e.title ?? e.name ?? '').toUpperCase();
-      return t.includes(sym) && t.includes('UP') && t.includes('DOWN');
-    }) ??
-    list.find(e => {
-      const t = String(e.title ?? e.name ?? '').toUpperCase();
-      return t.includes(sym);
-    });
+  // Strict match ONLY — must contain symbol AND both UP and DOWN.
+  // No fallback: if the 15-min UP/DOWN window is not open, throw and retry.
+  // A loose fallback previously caused the agent to trade "BTC to outperform
+  // Gold" between windows, which is a completely different market type.
+  const event = list.find(e => {
+    const t = String(e.title ?? e.name ?? '').toUpperCase();
+    return t.includes(sym) && t.includes('UP') && t.includes('DOWN');
+  });
 
   if (!event) {
-    throw new Error(`No open event found for ${ms.symbol}`);
+    // Clear stale IDs so no trade can fire against a previous window's event
+    ms.eventId  = null;
+    ms.marketId = null;
+    ms.yesPrice = null;
+    ms.noPrice  = null;
+    throw new Error(`No open UP/DOWN event for ${ms.symbol} — between windows, will retry`);
   }
 
   const market = event.market ?? event.markets?.[0] ?? {};
@@ -268,6 +274,9 @@ async function refreshOdds(ms) {
       }
       return;
     }
+
+    // Sync marketId from live response — corrects any bad value from event init (fixes SOL 404)
+    if (market.id) ms.marketId = market.id;
 
     if (market.outcome1Id) { ms.outcome1Id = market.outcome1Id; ms.yesOutcomeId = market.outcome1Id; }
     if (market.outcome2Id) { ms.outcome2Id = market.outcome2Id; ms.noOutcomeId  = market.outcome2Id; }
