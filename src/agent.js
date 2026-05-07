@@ -158,8 +158,11 @@ async function fetchJson(path, init = {}) {
 }
 
 // ── Event context (per-market) ────────────────────────────────────────────────
-// Uses seriesSlug to always fetch the current open window for this market.
-function parseOpenEventFromSeries(payload, ms) {
+// Fetches all open crypto events and finds the one for this market by title.
+// Same proven approach the original BTC engine used — category+title search.
+async function refreshEventContext(ms) {
+  const payload = await fetchJson('/v1/pm/events?category=crypto&status=open');
+
   const list = Array.isArray(payload?.data)
     ? payload.data
     : Array.isArray(payload?.events)
@@ -168,38 +171,37 @@ function parseOpenEventFromSeries(payload, ms) {
         ? payload
         : [];
 
-  // seriesSlug filter returns only this series' events — first open one is the live window
-  const event = list[0];
+  const sym = ms.symbol.toUpperCase();
+
+  // Primary: symbol + UP/DOWN in title e.g. "BTC UP/DOWN 15min"
+  // Fallback: symbol anywhere in title
+  const event =
+    list.find(e => {
+      const t = String(e.title ?? e.name ?? '').toUpperCase();
+      return t.includes(sym) && t.includes('UP') && t.includes('DOWN');
+    }) ??
+    list.find(e => {
+      const t = String(e.title ?? e.name ?? '').toUpperCase();
+      return t.includes(sym);
+    });
+
   if (!event) {
-    throw new Error(`No open event found for ${ms.symbol} (seriesSlug=${ms.seriesSlug})`);
+    throw new Error(`No open event found for ${ms.symbol}`);
   }
 
   const market = event.market ?? event.markets?.[0] ?? {};
+  const eventId = event.id ?? event.eventId;
 
-  return {
-    eventId:    event.id ?? event.eventId,
-    marketId:   market.id ?? market.marketId,
-    eventTitle: event.title ?? event.name ?? `${ms.name} UP/DOWN`,
-    resolvesAt: event.resolvesAt ?? event.endTime ?? event.closeTime ?? null,
-  };
-}
-
-async function refreshEventContext(ms) {
-  const payload = await fetchJson(
-    `/v1/pm/events?seriesSlug=${ms.seriesSlug}&status=open`,
-  );
-  const ctx = parseOpenEventFromSeries(payload, ms);
-
-  if (ctx.eventId !== ms.previousEventId) {
+  if (eventId !== ms.previousEventId) {
     ms.openingPrice = ms.currentPrice;
-    ms.previousEventId = ctx.eventId;
+    ms.previousEventId = eventId;
     console.log(`[${ms.symbol}] New window — opening price: ${ms.openingPrice}`);
   }
 
-  ms.eventId    = ctx.eventId;
-  ms.marketId   = ctx.marketId;
-  ms.eventTitle = ctx.eventTitle;
-  ms.resolvesAt = ctx.resolvesAt;
+  ms.eventId    = eventId;
+  ms.marketId   = market.id ?? market.marketId;
+  ms.eventTitle = event.title ?? event.name ?? `${ms.name} UP/DOWN`;
+  ms.resolvesAt = event.resolvesAt ?? event.endTime ?? event.closeTime ?? null;
 
   if (!ms.eventId || !ms.marketId) {
     throw new Error(`[${ms.symbol}] Event context missing eventId or marketId`);
