@@ -17,7 +17,6 @@ import crypto from 'node:crypto';
    return {
     'Content-Type': 'application/json',
     'X-Public-Key': publicKey,
-    'X-Public-Key': getEnvOrThrow('BAYSE_PUBLIC_KEY'),
    };
  }
  
