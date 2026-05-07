@@ -359,11 +359,17 @@ function createReconnectableWs(name, url, handlers) {
     });
 
     socket.on('message', async (raw) => {
-      try {
-        const message = JSON.parse(String(raw));
-        await handlers.onMessage(message);
-      } catch (err) {
-        console.error(`[ws:${name}] message error:`, err.message);
+      // Bayse WS sends NDJSON (newline-delimited JSON) when multiple symbols
+      // are subscribed — each symbol's update is a separate JSON object on its
+      // own line within a single frame. Split and parse each line individually.
+      const lines = String(raw).split('\n').map(l => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        try {
+          const message = JSON.parse(line);
+          await handlers.onMessage(message);
+        } catch (err) {
+          console.error(`[ws:${name}] message parse error:`, err.message);
+        }
       }
     });
 
