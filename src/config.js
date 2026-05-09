@@ -32,29 +32,37 @@ export const MARKETS = [
   {
     name: 'BTC 15min',
     symbol: 'BTC',
-    priceSymbol: 'BTCUSDT',    // Available on Bayse WS
-    klineSymbol: 'BTCUSDT',
+    priceSource: 'binance-ws',     // Live price feed: Bayse WS (sourced from Binance)
+    priceSymbol: 'BTCUSDT',        // Symbol subscribed to on Bayse WS
+    klineSymbol: 'BTCUSDT',        // Binance klines for regime + indicators
+    chainlinkAddress: null,        // BTC does not use Chainlink feed
     seriesSlug: 'crypto-btc-15m',
   },
   {
     name: 'ETH 15min',
     symbol: 'ETH',
-    priceSymbol: 'ETHUSDT',    // Available on Bayse WS
-    klineSymbol: 'ETHUSDT',
+    priceSource: 'chainlink',      // Live price feed: Chainlink onchain aggregator
+    priceSymbol: null,             // Not using Bayse WS for price
+    klineSymbol: 'ETHUSDT',        // Binance klines still used for regime + indicators
+    chainlinkAddress: '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419', // ETH/USD mainnet
     seriesSlug: 'crypto-eth-15m',
   },
   {
     name: 'SOL 15min',
     symbol: 'SOL',
-    priceSymbol: 'SOLUSDT',    // Available on Bayse WS
-    klineSymbol: 'SOLUSDT',
+    priceSource: 'chainlink',      // Live price feed: Chainlink onchain aggregator
+    priceSymbol: null,             // Not using Bayse WS for price
+    klineSymbol: 'SOLUSDT',        // Binance klines still used for regime + indicators
+    chainlinkAddress: '0x4ffC43a60e009B551865A93d232E33Fce9f01507', // SOL/USD mainnet
     seriesSlug: 'crypto-sol-15m',
   },
   {
     name: 'BNB 15min',
     symbol: 'BNB',
-    priceSymbol: null,          // NOT on Bayse WS — fed via Binance WS miniTicker
-    klineSymbol: 'BNBUSDT',
+    priceSource: 'chainlink',      // Live price feed: Chainlink onchain aggregator
+    priceSymbol: null,             // Not using Bayse WS or Binance WS for price
+    klineSymbol: 'BNBUSDT',        // Binance klines still used for regime + indicators
+    chainlinkAddress: '0x14e613AC84a31f709eadbdF89C6CC390fDc9540A', // BNB/USD mainnet
     seriesSlug: 'crypto-bnb-15m',
   },
 ];

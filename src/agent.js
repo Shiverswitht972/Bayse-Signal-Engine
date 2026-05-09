@@ -15,6 +15,7 @@ import {
   WS_BACKOFF_MAX_MS,
   WS_BACKOFF_START_MS,
 } from './config.js';
+import { startChainlinkFeed } from './chainlink.js';
 
 export { getCandles } from './candles.js';
 
@@ -195,13 +196,28 @@ async function refreshEventContext(ms) {
     throw new Error(`No open UP/DOWN event for ${ms.symbol} — between windows, will retry`);
   }
 
-  const market = event.market ?? event.markets?.[0] ?? {};
+  const market  = event.market ?? event.markets?.[0] ?? {};
   const eventId = event.id ?? event.eventId;
 
+  // Read the authoritative opening price (the "line") directly from the API.
+  // For ETH/SOL/BNB this is the Chainlink price at window open — NOT our
+  // Binance feed. Using our Binance current price as a proxy was wrong:
+  // dead zone and direction tracking were both comparing against the wrong line.
+  // eventThreshold (event level) and marketThreshold (market level) are the
+  // canonical fields — confirmed in Bayse API docs response schema.
+  const thresholdFromApi =
+    Number(event.eventThreshold ?? market.marketThreshold ?? NaN);
+
   if (eventId !== ms.previousEventId) {
-    ms.openingPrice = ms.currentPrice;
     ms.previousEventId = eventId;
-    console.log(`[${ms.symbol}] New window — opening price: ${ms.openingPrice}`);
+    // Prefer the API threshold; fall back to current Binance price only if absent
+    ms.openingPrice = Number.isFinite(thresholdFromApi)
+      ? thresholdFromApi
+      : ms.currentPrice;
+    console.log(
+      `[${ms.symbol}] New window — line: ${ms.openingPrice} ` +
+      `(source: ${Number.isFinite(thresholdFromApi) ? 'eventThreshold' : 'binance-fallback'})`
+    );
   }
 
   ms.eventId    = eventId;
@@ -442,12 +458,9 @@ export async function startAgent() {
     }, MINUTES_BETWEEN_TRADES * 60 * 1000);
   }
 
-  // ── Bayse WS — BTC, ETH, SOL price feed ──────────────────────────────────
-  // BNBUSDT is not available on the Bayse asset_prices channel.
-  const bayseSymbols = MARKETS
-    .filter(m => m.priceSymbol !== null)
-    .map(m => m.priceSymbol);  // ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
-
+  // ── Bayse WS — BTC price feed only ──────────────────────────────────────
+  // ETH, SOL, BNB have moved to Chainlink onchain feeds below.
+  // BTC remains on the Bayse WS (sourced from Binance).
   createReconnectableWs(
     'bayse-prices',
     'wss://socket.bayse.markets/ws/v1/realtime',
@@ -456,18 +469,17 @@ export async function startAgent() {
         socket.send(JSON.stringify({
           type: 'subscribe',
           channel: 'asset_prices',
-          symbols: bayseSymbols,
+          symbols: ['BTCUSDT'],
         }));
-        console.log(`[ws:bayse-prices] Subscribed: ${bayseSymbols.join(', ')}`);
+        console.log('[ws:bayse-prices] Subscribed: BTCUSDT');
       },
       onMessage: async (message) => {
         if (message.type !== 'asset_price') return;
 
         const sym = message.data?.symbol;
-        if (!sym) return;
+        if (sym !== 'BTCUSDT') return;
 
-        // Map priceSymbol (e.g. 'ETHUSDT') → marketState
-        const ms = [...marketStates.values()].find(m => m.priceSymbol === sym);
+        const ms = marketStates.get('BTC');
         if (!ms) return;
 
         addPriceTick(ms, message.data ?? message);
@@ -479,36 +491,24 @@ export async function startAgent() {
     },
   );
 
-  // ── Binance WS — BNB price feed ───────────────────────────────────────────
-  // BNBUSDT is not on the Bayse WS, so we connect to Binance's miniTicker
-  // stream directly. miniTicker fires every second with the last traded price.
-  // Uses data-stream.binance.vision (official Binance market data mirror,
-  // no geo restrictions) as the primary endpoint.
-  // If the stream is unreachable from your Render region, consider switching
-  // to the REST polling fallback: poll fetchKlines('BNBUSDT', 1) every 2s.
-  const bnbState = marketStates.get('BNB');
-  if (bnbState) {
-    createReconnectableWs(
-      'binance-bnb',
-      'wss://data-stream.binance.vision/ws/bnbusdt@miniTicker',
-      {
-        onOpen: async () => {
-          console.log('[ws:binance-bnb] BNBUSDT miniTicker connected');
-        },
-        onMessage: async (message) => {
-          // Binance miniTicker payload: { e:'24hrMiniTicker', c:'<last price>', ... }
-          if (!message.c) return;
-          addPriceTick(bnbState, {
-            price: Number(message.c),
-            timestamp: new Date().toISOString(),
-          });
-          if (bnbState.yesPrice != null) {
-            await evaluateAndMaybeTrade(bnbState);
-          }
-        },
-      },
-    );
-  }
+  // ── Chainlink onchain feeds — ETH, SOL, BNB price feed ───────────────────
+  // Polls Chainlink AggregatorV3 contracts on Ethereum mainnet every 2s.
+  // Fires on new rounds only (round-ID change detection).
+  // Falls through a public RPC fallback chain on provider errors.
+  const chainlinkFeeds = MARKETS
+    .filter(m => m.priceSource === 'chainlink' && m.chainlinkAddress)
+    .map(m => ({ symbol: m.symbol, address: m.chainlinkAddress }));
+
+  startChainlinkFeed(chainlinkFeeds, async (symbol, price, timestamp) => {
+    const ms = marketStates.get(symbol);
+    if (!ms) return;
+
+    addPriceTick(ms, { price, timestamp });
+
+    if (ms.yesPrice != null) {
+      await evaluateAndMaybeTrade(ms);
+    }
+  });
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
