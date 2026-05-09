@@ -10,6 +10,7 @@
     "start": "node src/run.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "ethers": "^6.13.0"
   }
 }
