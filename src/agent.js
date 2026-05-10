@@ -15,7 +15,6 @@ import {
   WS_BACKOFF_MAX_MS,
   WS_BACKOFF_START_MS,
 } from './config.js';
-import { startChainlinkFeed } from './chainlink.js';
 
 export { getCandles } from './candles.js';
 
@@ -458,9 +457,13 @@ export async function startAgent() {
     }, MINUTES_BETWEEN_TRADES * 60 * 1000);
   }
 
-  // ── Bayse WS — BTC price feed only ──────────────────────────────────────
-  // ETH, SOL, BNB have moved to Chainlink onchain feeds below.
-  // BTC remains on the Bayse WS (sourced from Binance).
+  // ── Bayse WS — BTC, ETH, SOL price feed ─────────────────────────────────
+  // All three are available on the Bayse realtime feed (sourced from Binance).
+  // Incoming ticks are routed to the correct market state by priceSymbol.
+  const bayseSymbols = MARKETS
+    .filter(m => m.priceSymbol !== null)
+    .map(m => m.priceSymbol);  // ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+
   createReconnectableWs(
     'bayse-prices',
     'wss://socket.bayse.markets/ws/v1/realtime',
@@ -469,17 +472,17 @@ export async function startAgent() {
         socket.send(JSON.stringify({
           type: 'subscribe',
           channel: 'asset_prices',
-          symbols: ['BTCUSDT'],
+          symbols: bayseSymbols,
         }));
-        console.log('[ws:bayse-prices] Subscribed: BTCUSDT');
+        console.log(`[ws:bayse-prices] Subscribed: ${bayseSymbols.join(', ')}`);
       },
       onMessage: async (message) => {
         if (message.type !== 'asset_price') return;
 
         const sym = message.data?.symbol;
-        if (sym !== 'BTCUSDT') return;
+        if (!sym) return;
 
-        const ms = marketStates.get('BTC');
+        const ms = [...marketStates.values()].find(m => m.priceSymbol === sym);
         if (!ms) return;
 
         addPriceTick(ms, message.data ?? message);
@@ -491,24 +494,31 @@ export async function startAgent() {
     },
   );
 
-  // ── Chainlink onchain feeds — ETH, SOL, BNB price feed ───────────────────
-  // Polls Chainlink AggregatorV3 contracts on Ethereum mainnet every 2s.
-  // Fires on new rounds only (round-ID change detection).
-  // Falls through a public RPC fallback chain on provider errors.
-  const chainlinkFeeds = MARKETS
-    .filter(m => m.priceSource === 'chainlink' && m.chainlinkAddress)
-    .map(m => ({ symbol: m.symbol, address: m.chainlinkAddress }));
-
-  startChainlinkFeed(chainlinkFeeds, async (symbol, price, timestamp) => {
-    const ms = marketStates.get(symbol);
-    if (!ms) return;
-
-    addPriceTick(ms, { price, timestamp });
-
-    if (ms.yesPrice != null) {
-      await evaluateAndMaybeTrade(ms);
-    }
-  });
+  // ── Binance WS — BNB price feed ──────────────────────────────────────────
+  // BNBUSDT is not available on the Bayse WS — connect directly to Binance.
+  // miniTicker fires every second with the last traded price (field: c).
+  const bnbState = marketStates.get('BNB');
+  if (bnbState) {
+    createReconnectableWs(
+      'binance-bnb',
+      'wss://data-stream.binance.vision/ws/bnbusdt@miniTicker',
+      {
+        onOpen: async () => {
+          console.log('[ws:binance-bnb] BNBUSDT miniTicker connected');
+        },
+        onMessage: async (message) => {
+          if (!message.c) return;
+          addPriceTick(bnbState, {
+            price: Number(message.c),
+            timestamp: new Date().toISOString(),
+          });
+          if (bnbState.yesPrice != null) {
+            await evaluateAndMaybeTrade(bnbState);
+          }
+        },
+      },
+    );
+  }
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
