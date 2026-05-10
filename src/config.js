@@ -32,37 +32,29 @@ export const MARKETS = [
   {
     name: 'BTC 15min',
     symbol: 'BTC',
-    priceSource: 'binance-ws',     // Live price feed: Bayse WS (sourced from Binance)
-    priceSymbol: 'BTCUSDT',        // Symbol subscribed to on Bayse WS
-    klineSymbol: 'BTCUSDT',        // Binance klines for regime + indicators
-    chainlinkAddress: null,        // BTC does not use Chainlink feed
+    priceSymbol: 'BTCUSDT',   // Bayse WS realtime feed
+    klineSymbol: 'BTCUSDT',   // Binance klines for regime + indicators
     seriesSlug: 'crypto-btc-15m',
   },
   {
     name: 'ETH 15min',
     symbol: 'ETH',
-    priceSource: 'chainlink',      // Live price feed: Chainlink onchain aggregator
-    priceSymbol: null,             // Not using Bayse WS for price
-    klineSymbol: 'ETHUSDT',        // Binance klines still used for regime + indicators
-    chainlinkAddress: '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419', // ETH/USD mainnet
+    priceSymbol: 'ETHUSDT',   // Bayse WS realtime feed
+    klineSymbol: 'ETHUSDT',
     seriesSlug: 'crypto-eth-15m',
   },
   {
     name: 'SOL 15min',
     symbol: 'SOL',
-    priceSource: 'chainlink',      // Live price feed: Chainlink onchain aggregator
-    priceSymbol: null,             // Not using Bayse WS for price
-    klineSymbol: 'SOLUSDT',        // Binance klines still used for regime + indicators
-    chainlinkAddress: '0x4ffC43a60e009B551865A93d232E33Fce9f01507', // SOL/USD mainnet
+    priceSymbol: 'SOLUSDT',   // Bayse WS realtime feed
+    klineSymbol: 'SOLUSDT',
     seriesSlug: 'crypto-sol-15m',
   },
   {
     name: 'BNB 15min',
     symbol: 'BNB',
-    priceSource: 'chainlink',      // Live price feed: Chainlink onchain aggregator
-    priceSymbol: null,             // Not using Bayse WS or Binance WS for price
-    klineSymbol: 'BNBUSDT',        // Binance klines still used for regime + indicators
-    chainlinkAddress: '0x14e613AC84a31f709eadbdF89C6CC390fDc9540A', // BNB/USD mainnet
+    priceSymbol: null,         // Not on Bayse WS — uses Binance WS miniTicker
+    klineSymbol: 'BNBUSDT',
     seriesSlug: 'crypto-bnb-15m',
   },
 ];
