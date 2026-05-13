@@ -281,12 +281,14 @@ async function refreshOdds(ms) {
     if (Number.isFinite(no)  && no  > 0) ms.noPrice  = no;
 
     if (yes === 0 && no === 0) {
-      console.log(`[${ms.symbol}:odds] Window closed — refreshing event context`);
+      // Window closed — clear state so shouldSkipEvaluation blocks this market.
+      // Do NOT call refreshEventContext here: that caused an endless loop firing
+      // every 30s. The per-market interval below handles recovery silently.
       ms.yesPrice = null;
       ms.noPrice  = null;
-      try { await refreshEventContext(ms); } catch (_) {
-        console.log(`[${ms.symbol}:odds] No new window open yet, will retry`);
-      }
+      ms.eventId  = null;
+      ms.marketId = null;
+      console.log(`[${ms.symbol}:odds] Window closed — awaiting next window`);
       return;
     }
 
@@ -439,22 +441,26 @@ export async function startAgent() {
   // ── Wallet-level intervals ────────────────────────────────────────────────
   setInterval(refreshBalance, BALANCE_REFRESH_MS);
 
-  // ── Per-market intervals ──────────────────────────────────────────────────
+  // ── Per-market smart interval — runs every 30s ───────────────────────────
+  // When in a window (eventId set): refreshes odds only.
+  // When between windows (eventId null): silently tries to find the new event.
+  // This single interval replaces two separate ones and eliminates the loop
+  // that previously fired refreshEventContext from inside refreshOdds.
   for (const ms of marketStates.values()) {
-    // Odds polling every 30s
-    setInterval(() => refreshOdds(ms).catch(err =>
-      console.error(`[${ms.symbol}:odds] interval error:`, err.message)
-    ), ODDS_REFRESH_MS);
-
-    // Event context refresh every 15 minutes (aligns with window duration)
     setInterval(async () => {
       try {
-        await refreshEventContext(ms);
-        await refreshOdds(ms);
+        if (!ms.eventId) {
+          // Between windows — try to find the next one, stay silent on failure
+          await refreshEventContext(ms);
+          await refreshOdds(ms);
+        } else {
+          // In window — odds refresh only
+          await refreshOdds(ms);
+        }
       } catch (err) {
-        console.error(`[${ms.symbol}] Context refresh failed:`, err.message);
+        // No open window yet — suppress log spam, retry next interval
       }
-    }, MINUTES_BETWEEN_TRADES * 60 * 1000);
+    }, ODDS_REFRESH_MS);
   }
 
   // ── Bayse WS — BTC, ETH, SOL price feed ─────────────────────────────────
