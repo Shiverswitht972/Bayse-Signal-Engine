@@ -1,7 +1,7 @@
 import { BASE_URL, buildWriteHeaders } from './auth.js';
 import { getCandles } from './candles.js';
 import { generateAlphaSignal, combineSignals } from './alpha.js';
-import { fetchKlines } from './perception.js';
+import { fetchBTCKlines } from './perception.js';
 import { classifyRegime } from './regime.js';
 import {
   CURRENCY,
@@ -97,7 +97,7 @@ function computeDelta5m(priceHistory) {
   return ((latest.price - baseline.price) / baseline.price) * 100;
 }
 
-function computeMomentum(priceHistory, internalCandles, binanceCandles, symbol) {
+function computeMomentum(priceHistory, internalCandles, binanceCandles) {
   const candles = (binanceCandles && binanceCandles.length >= 35)
     ? binanceCandles
     : internalCandles;
@@ -112,7 +112,7 @@ function computeMomentum(priceHistory, internalCandles, binanceCandles, symbol) 
   const deltaScore = clamp(delta5m / 1.0, -1, 1);
 
   console.log(
-    `[signal:${symbol}] source=${candles === binanceCandles ? 'binance' : 'internal'} candles=${candles.length} rsi=${rsi?.toFixed(2) ?? 'null'} macd=${macdValues ? `${macdValues.macd.toFixed(4)}>${macdValues.signal.toFixed(4)}` : 'null'}`,
+    `[signal:data] source=${candles === binanceCandles ? 'binance' : 'internal'} candles=${candles.length} rsi=${rsi?.toFixed(2) ?? 'null'} macd=${macdValues ? `${macdValues.macd.toFixed(4)}>${macdValues.signal.toFixed(4)}` : 'null'}`,
   );
 
   const momentumScore = clamp((rsiScore + macdScore + deltaScore) / 3, -1, 1);
@@ -172,17 +172,13 @@ async function fetchQuoteFeeRatio(eventId, marketId, outcomeId) {
 export async function generateSignal(state) {
   const yesPrice = Number(state.yesPrice);
 
-  // ── Fetch Binance candles for this market's asset ─────────────────────────
-  // state.klineSymbol is set per-market: 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'
-  const klineSymbol = state.klineSymbol ?? 'BTCUSDT';
-  const symbol = state.symbol ?? klineSymbol.replace('USDT', '');
-
+  // ── Fetch Binance candles ──────────────────────────────────────────────────
   let binanceCandles = null;
   try {
-    binanceCandles = await fetchKlines(klineSymbol, REGIME_CANDLE_LIMIT);
-    console.log(`[signal:${symbol}] Binance candles fetched: ${binanceCandles.length}`);
+    binanceCandles = await fetchBTCKlines(REGIME_CANDLE_LIMIT);
+    console.log(`[signal] Binance candles fetched: ${binanceCandles.length}`);
   } catch (err) {
-    console.warn(`[signal:${symbol}] Binance fetch failed, falling back to internal: ${err.message}`);
+    console.warn(`[signal] Binance fetch failed, falling back to internal candles: ${err.message}`);
   }
 
   // ── Regime filter ──────────────────────────────────────────────────────────
@@ -191,12 +187,13 @@ export async function generateSignal(state) {
     try {
       regime = classifyRegime(binanceCandles);
     } catch (err) {
-      console.warn(`[regime:${symbol}] Classification error — proceeding without filter: ${err.message}`);
+      console.warn(`[regime] Classification error — proceeding without filter: ${err.message}`);
       regime = { regime: 'UNKNOWN', reason: err.message };
     }
 
-    console.log(`[regime:${symbol}] ${regime.regime} — ${regime.reason}`);
+    console.log(`[regime] ${regime.regime} — ${regime.reason}`);
 
+    // Block flat or choppy markets
     if (regime.regime === 'CHOPPY' || regime.regime === 'FLAT') {
       return {
         shouldTrade: false,
@@ -211,8 +208,12 @@ export async function generateSignal(state) {
       };
     }
 
+    // ✅ FIX 2: Block when MACD contradicts the EMA trend direction
+    // This is exactly what happened in the trade that blew the port —
+    // regime called TRENDING DOWN but MACD was bullish (macd > signal).
+    // When indicators disagree like that, the trend read is unreliable.
     if (regime.regime === 'TRENDING' && regime.contradicted) {
-      console.warn(`[regime:${symbol}] TRENDING ${regime.direction} blocked — MACD contradicts (${regime.macdDirection})`);
+      console.warn(`[regime] TRENDING ${regime.direction} blocked — MACD contradicts (${regime.macdDirection})`);
       return {
         shouldTrade: false,
         direction: null,
@@ -233,7 +234,6 @@ export async function generateSignal(state) {
     state.priceHistory,
     internalCandles,
     binanceCandles,
-    symbol,
   );
 
   const candlesForVolume = (binanceCandles && binanceCandles.length >= 6)
@@ -241,8 +241,8 @@ export async function generateSignal(state) {
     : internalCandles;
   const volumeScore = computeVolumeScore(candlesForVolume, momentumScore);
 
-  // ── Model probability ──────────────────────────────────────────────────────
-  const modelP    = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
+  // ── Clean model probability — no circular yesPrice anchor ─────────────────
+  const modelP   = clamp(0.5 + momentumScore * 0.3 + volumeScore * 0.2, 0, 1);
   const hasSignal = Math.abs(momentumScore) > 0.1 || Math.abs(volumeScore) > 0.1;
   const pUp       = hasSignal ? modelP : 0.5;
 
@@ -314,13 +314,13 @@ export async function generateSignal(state) {
   else if (absEdge >= 0.10) threshold -= 0.05;
 
   console.log(
-    `[signal:${symbol}] yes_edge=${netYesEdge === -Infinity ? 'no-liq' : netYesEdge.toFixed(3)} no_edge=${netNoEdge === -Infinity ? 'no-liq' : netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`,
+    `[signal:detail] yes_edge=${netYesEdge === -Infinity ? 'no-liq' : netYesEdge.toFixed(3)} no_edge=${netNoEdge === -Infinity ? 'no-liq' : netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`,
   );
 
   const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
   const kelly      = pricedSide > 0 ? directionalEdge / pricedSide : 0;
   const rawStake   = kelly * state.balance * KELLY_FRACTION;
-  const maxAffordableStake        = Math.min(MAX_STAKE_NGN, state.balance);
+  const maxAffordableStake     = Math.min(MAX_STAKE_NGN, state.balance);
   const hasMinimumBalanceForStake = maxAffordableStake >= MIN_STAKE_NGN;
   const stake = hasMinimumBalanceForStake
     ? clamp(rawStake, MIN_STAKE_NGN, maxAffordableStake)
@@ -352,7 +352,7 @@ export async function generateSignal(state) {
     // alpha is fail-safe — ignore errors
   }
 
-  console.log(`[alpha:${symbol}] active=${alphaSignal.active} dir=${alphaSignal.direction} strength=${alphaSignal.strength?.toFixed(4) ?? 'n/a'}`);
+  console.log(`[alpha] active=${alphaSignal.active} dir=${alphaSignal.direction} strength=${alphaSignal.strength?.toFixed(4) ?? 'n/a'}`);
 
   return combineSignals(baseSignal, alphaSignal, state);
 }

@@ -7,18 +7,15 @@ export async function sendNotification(signal, result, state) {
     return;
   }
 
-  const status  = result.success ? 'filled' : 'failed';
+  const status = result.success ? 'filled' : 'failed';
   const orderId = result.orderId ?? 'n/a';
-
-  // Use the market's human name (e.g. 'ETH 15min') falling back to eventTitle
-  const marketLabel = state.name ?? state.eventTitle ?? 'UP/DOWN 15min';
 
   const text = [
     'Bayse Signal Engine',
     '───────────────────',
-    `Market : ${marketLabel}`,
+    `Market : ${state.eventTitle ?? 'BTC 15-min UP/DOWN'}`,
     `YES    : ${state.yesPrice ?? 'n/a'}  NO: ${state.noPrice ?? 'n/a'}`,
-    `${state.symbol ?? 'Price'} : $${state.currentPrice ?? state.btcPrice ?? 'n/a'}`,
+    `BTC    : $${state.btcPrice ?? 'n/a'}`,
     `D5m    : ${(signal.delta5m ?? 0).toFixed(3)}%`,
     '',
     'Analysis',
@@ -40,7 +37,10 @@ export async function sendNotification(signal, result, state) {
   const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+    }),
   });
 
   if (!response.ok) {

@@ -9,136 +9,98 @@ import {
   CURRENCY,
   DAILY_LOSS_FLOOR,
   MARKET_END_BUFFER_MINUTES,
-  MARKETS,
   MIN_HISTORY_POINTS,
   MINUTES_BETWEEN_TRADES,
   WS_BACKOFF_MAX_MS,
   WS_BACKOFF_START_MS,
 } from './config.js';
 
-export { getCandles } from './candles.js';
-
 const ODDS_REFRESH_MS = 30_000;
 
-// ── Wallet state — shared across all markets (single NGN balance) ─────────────
-const walletState = {
+const state = {
+  btcPrice: null,
+  priceHistory: [],
+  yesPrice: null,
+  noPrice: null,
+  yesOutcomeId: null,
+  noOutcomeId: null,
+  outcome1Id: null,
+  outcome2Id: null,
+  eventId: null,
+  marketId: null,
+  eventTitle: null,
+  resolvesAt: null,
+  openingPrice: null,
   balance: null,
+  lastTradeAt: null,
   dailyPnL: 0,
   dailyPnLResetDate: null,
   dayStartBalance: null,
 };
 
-// ── Per-market state factory ──────────────────────────────────────────────────
-function createMarketState(cfg) {
-  return {
-    // Identity
-    symbol: cfg.symbol,
-    name: cfg.name,
-    priceSymbol: cfg.priceSymbol,   // Symbol on Bayse WS (null = use Binance WS)
-    klineSymbol: cfg.klineSymbol,   // Symbol for Binance klines API
-    seriesSlug: cfg.seriesSlug,     // Bayse event series slug
+export { getCandles } from './candles.js';
 
-    // Price feed
-    currentPrice: null,
-    priceHistory: [],
+let isEvaluatingSignal = false;
+let pendingEvaluation = false;
+let previousEventId = null;
 
-    // Market / event context
-    yesPrice: null,
-    noPrice: null,
-    yesOutcomeId: null,
-    noOutcomeId: null,
-    outcome1Id: null,
-    outcome2Id: null,
-    eventId: null,
-    marketId: null,
-    eventTitle: null,
-    resolvesAt: null,
-    openingPrice: null,
-    previousEventId: null,
-
-    // Trade cooldown (per-market — each market can trade independently)
-    lastTradeAt: null,
-
-    // Evaluation concurrency lock (per-market)
-    isEvaluatingSignal: false,
-    pendingEvaluation: false,
-  };
-}
-
-// Build the Map of all market states keyed by symbol
-const marketStates = new Map(MARKETS.map(cfg => [cfg.symbol, createMarketState(cfg)]));
-
-// ── Merged state view ─────────────────────────────────────────────────────────
-// Signal, executor, and skip-checks receive this object.
-// Merges per-market state with wallet-level fields.
-// btcPrice alias ensures expiryDeadZone + legacy compatibility.
-function getEffectiveState(ms) {
-  return {
-    ...ms,
-    btcPrice: ms.currentPrice,          // legacy alias used by expiryDeadZone
-    balance: walletState.balance,
-    dailyPnL: walletState.dailyPnL,
-  };
-}
-
-// ── Daily PnL reset ───────────────────────────────────────────────────────────
 function resetDailyPnlIfNeeded() {
   const utcDate = new Date().toISOString().slice(0, 10);
-  if (walletState.dailyPnLResetDate !== utcDate) {
-    walletState.dailyPnL = 0;
-    walletState.dailyPnLResetDate = utcDate;
-    walletState.dayStartBalance = walletState.balance;
-    console.log(`[wallet] Daily PnL reset for ${utcDate}`);
+  if (state.dailyPnLResetDate !== utcDate) {
+    state.dailyPnL = 0;
+    state.dailyPnLResetDate = utcDate;
+    state.dayStartBalance = state.balance;
+    console.log(`[agent] Daily PnL reset for UTC date ${utcDate}`);
   }
 }
 
-// ── Skip evaluation checks (per-market) ──────────────────────────────────────
-function minutesUntilResolution(ms) {
-  if (!ms.resolvesAt) return Number.POSITIVE_INFINITY;
-  return (new Date(ms.resolvesAt).getTime() - Date.now()) / 60_000;
+function minutesUntilResolution() {
+  if (!state.resolvesAt) return Number.POSITIVE_INFINITY;
+  const msLeft = new Date(state.resolvesAt).getTime() - Date.now();
+  return msLeft / 60000;
 }
 
-function shouldSkipEvaluation(ms) {
-  if (!ms.eventId || !ms.marketId) {
-    return 'No confirmed event/market ID — between windows or wrong market type';
+function shouldSkipEvaluation() {
+  // ✅ FIX 1: Tightened from 0.10/0.90 to 0.15/0.80
+  // When the market prices YES at 80%+ it has strong conviction backed by
+  // real liquidity and participant knowledge. Betting against it with a
+  // momentum model on 1m candles is a low-probability play — skip it.
+  if (state.yesPrice !== null && (state.yesPrice < 0.15 || state.yesPrice > 0.80)) {
+    return `Market too one-sided (yesPrice=${state.yesPrice?.toFixed(2)}) — skipping`;
   }
 
-  if (ms.yesPrice !== null && (ms.yesPrice < 0.15 || ms.yesPrice > 0.80)) {
-    return `Market too one-sided (yesPrice=${ms.yesPrice?.toFixed(2)})`;
-  }
-
-  if (ms.priceHistory.length < MIN_HISTORY_POINTS) {
+  if (state.priceHistory.length < MIN_HISTORY_POINTS) {
     return 'Not enough price history yet';
   }
 
-  if (walletState.balance == null || walletState.balance <= 0) {
+  if (state.balance == null || state.balance <= 0) {
     return 'Missing or non-positive balance';
   }
 
-  if (walletState.dailyPnL <= -DAILY_LOSS_FLOOR) {
+  if (state.dailyPnL <= -DAILY_LOSS_FLOOR) {
     return `Daily loss floor reached (<= -${DAILY_LOSS_FLOOR})`;
   }
 
-  if (minutesUntilResolution(ms) < MARKET_END_BUFFER_MINUTES) {
+  if (minutesUntilResolution() < MARKET_END_BUFFER_MINUTES) {
     return `Market resolves in less than ${MARKET_END_BUFFER_MINUTES} minutes`;
   }
 
-  if (ms.lastTradeAt) {
-    const elapsedMs = Date.now() - new Date(ms.lastTradeAt).getTime();
+  if (state.lastTradeAt) {
+    const elapsedMs = Date.now() - new Date(state.lastTradeAt).getTime();
     if (elapsedMs < MINUTES_BETWEEN_TRADES * 60 * 1000) {
-      return `Last trade was less than ${MINUTES_BETWEEN_TRADES} minutes ago`;
+      return `Last trade was placed less than ${MINUTES_BETWEEN_TRADES} minutes ago`;
     }
   }
 
-  if (ms.currentPrice && ms.resolvesAt && ms.openingPrice) {
+  if (state.btcPrice && state.resolvesAt && state.openingPrice) {
     if (isInExpiryDeadZone(
-      new Date(ms.resolvesAt).getTime(),
-      ms.currentPrice,
-      ms.openingPrice,
+      new Date(state.resolvesAt).getTime(),
+      state.btcPrice,
+      state.openingPrice,
     )) {
-      const secsLeft = Math.round((new Date(ms.resolvesAt).getTime() - Date.now()) / 1000);
-      const priceDelta = Math.abs(ms.currentPrice - ms.openingPrice).toFixed(2);
-      console.warn(`[DEAD ZONE:${ms.symbol}] ${secsLeft}s to expiry, $${priceDelta} from line`);
+      const secsLeft = Math.round((new Date(state.resolvesAt).getTime() - Date.now()) / 1000);
+      const priceDelta = Math.abs(state.btcPrice - state.openingPrice).toFixed(2);
+      console.warn(`[DEAD ZONE] Skipped — ${secsLeft}s to expiry, price $${priceDelta} from line`);
       return 'Expiry dead zone — too close to line near resolution';
     }
   }
@@ -146,11 +108,13 @@ function shouldSkipEvaluation(ms) {
   return null;
 }
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
 async function fetchJson(path, init = {}) {
   const response = await fetch(`${BASE_URL}${path}`, {
     ...init,
-    headers: { ...(init.headers ?? {}), ...buildReadHeaders() },
+    headers: {
+      ...(init.headers ?? {}),
+      ...buildReadHeaders(),
+    },
   });
 
   if (!response.ok) {
@@ -161,213 +125,190 @@ async function fetchJson(path, init = {}) {
   return response.json();
 }
 
-// ── Event context (per-market) ────────────────────────────────────────────────
-// Fetches all open crypto events and finds the one for this market by title.
-// Same proven approach the original BTC engine used — category+title search.
-async function refreshEventContext(ms) {
-  const payload = await fetchJson('/v1/pm/events?category=crypto&status=open');
+function parseOpenBtcEvent(payload) {
+  const events = payload?.data ?? payload?.events ?? payload ?? [];
+  const list = Array.isArray(events) ? events : [];
 
-  const list = Array.isArray(payload?.data)
-    ? payload.data
-    : Array.isArray(payload?.events)
-      ? payload.events
-      : Array.isArray(payload)
-        ? payload
-        : [];
+  const btcEvent =
+    list.find((event) => {
+      const title = String(event.title ?? event.name ?? '').toUpperCase();
+      return title.includes('UP') && title.includes('DOWN') && title.includes('BTC');
+    }) ??
+    list.find((event) => {
+      const title = String(event.title ?? event.name ?? '').toUpperCase();
+      return title.includes('BITCOIN') && (title.includes('UP') || title.includes('DOWN'));
+    });
 
-  const sym = ms.symbol.toUpperCase();
-
-  // Strict match ONLY — must contain symbol AND both UP and DOWN.
-  // No fallback: if the 15-min UP/DOWN window is not open, throw and retry.
-  // A loose fallback previously caused the agent to trade "BTC to outperform
-  // Gold" between windows, which is a completely different market type.
-  const event = list.find(e => {
-    const t = String(e.title ?? e.name ?? '').toUpperCase();
-    return t.includes(sym) && t.includes('UP') && t.includes('DOWN');
-  });
-
-  if (!event) {
-    // Clear stale IDs so no trade can fire against a previous window's event
-    ms.eventId  = null;
-    ms.marketId = null;
-    ms.yesPrice = null;
-    ms.noPrice  = null;
-    throw new Error(`No open UP/DOWN event for ${ms.symbol} — between windows, will retry`);
+  if (!btcEvent) {
+    throw new Error('No open BTC UP/DOWN event found');
   }
 
-  const market  = event.market ?? event.markets?.[0] ?? {};
-  const eventId = event.id ?? event.eventId;
+  const market = btcEvent.market ?? btcEvent.markets?.[0] ?? {};
 
-  // Read the authoritative opening price (the "line") directly from the API.
-  // For ETH/SOL/BNB this is the Chainlink price at window open — NOT our
-  // Binance feed. Using our Binance current price as a proxy was wrong:
-  // dead zone and direction tracking were both comparing against the wrong line.
-  // eventThreshold (event level) and marketThreshold (market level) are the
-  // canonical fields — confirmed in Bayse API docs response schema.
-  const thresholdFromApi =
-    Number(event.eventThreshold ?? market.marketThreshold ?? NaN);
-
-  if (eventId !== ms.previousEventId) {
-    ms.previousEventId = eventId;
-    // Prefer the API threshold; fall back to current Binance price only if absent
-    ms.openingPrice = Number.isFinite(thresholdFromApi)
-      ? thresholdFromApi
-      : ms.currentPrice;
-    console.log(
-      `[${ms.symbol}] New window — line: ${ms.openingPrice} ` +
-      `(source: ${Number.isFinite(thresholdFromApi) ? 'eventThreshold' : 'binance-fallback'})`
-    );
-  }
-
-  ms.eventId    = eventId;
-  ms.marketId   = market.id ?? market.marketId;
-  ms.eventTitle = event.title ?? event.name ?? `${ms.name} UP/DOWN`;
-  ms.resolvesAt = event.resolvesAt ?? event.endTime ?? event.closeTime ?? null;
-
-  if (!ms.eventId || !ms.marketId) {
-    throw new Error(`[${ms.symbol}] Event context missing eventId or marketId`);
-  }
-
-  console.log(`[${ms.symbol}] Event: ${ms.eventTitle} (${ms.eventId})`);
+  return {
+    eventId: btcEvent.id ?? btcEvent.eventId,
+    marketId: market.id ?? market.marketId,
+    eventTitle: btcEvent.title ?? btcEvent.name ?? 'BTC market',
+    resolvesAt: btcEvent.resolvesAt ?? btcEvent.endTime ?? btcEvent.closeTime ?? null,
+  };
 }
 
-// ── Balance refresh (wallet-level — one NGN wallet across all markets) ─────────
+async function refreshEventContext() {
+  const payload = await fetchJson('/v1/pm/events?category=crypto&status=open');
+  const eventContext = parseOpenBtcEvent(payload);
+
+  if (eventContext.eventId !== previousEventId) {
+    state.openingPrice = state.btcPrice;
+    previousEventId = eventContext.eventId;
+    console.log(`[agent] New market window detected — opening price: $${state.openingPrice}`);
+  }
+
+  state.eventId = eventContext.eventId;
+  state.marketId = eventContext.marketId;
+  state.eventTitle = eventContext.eventTitle;
+  state.resolvesAt = eventContext.resolvesAt;
+
+  if (!state.eventId || !state.marketId) {
+    throw new Error('Event context is missing eventId or marketId');
+  }
+
+  console.log(`[agent] Event context: ${state.eventTitle} (${state.eventId})`);
+  return eventContext;
+}
+
 async function refreshBalance() {
   try {
     const data = await fetchJson('/v1/wallet/assets');
-    const ngnAsset = (data?.assets ?? []).find(a => a.symbol === 'NGN');
+    const assets = data?.assets ?? [];
+    const ngnAsset = assets.find(a => a.symbol === 'NGN');
     const balance = ngnAsset ? Number(ngnAsset.availableBalance) : null;
 
-    if (Number.isFinite(balance)) walletState.balance = balance;
+    if (Number.isFinite(balance)) {
+      state.balance = balance;
+    }
 
     resetDailyPnlIfNeeded();
 
-    if (walletState.dayStartBalance == null && walletState.balance != null) {
-      walletState.dayStartBalance = walletState.balance;
+    if (state.dayStartBalance == null && state.balance != null) {
+      state.dayStartBalance = state.balance;
     }
 
-    if (walletState.dayStartBalance != null && walletState.balance != null) {
-      walletState.dailyPnL = Number(
-        (walletState.balance - walletState.dayStartBalance).toFixed(2),
-      );
+    if (state.dayStartBalance != null && state.balance != null) {
+      state.dailyPnL = Number((state.balance - state.dayStartBalance).toFixed(2));
     }
 
-    console.log(
-      `[wallet] Balance: ${walletState.balance ?? 'unavailable'} ${CURRENCY} | dailyPnL=${walletState.dailyPnL}`,
-    );
-  } catch (err) {
-    console.error('[wallet] Balance refresh failed:', err.message);
+    console.log(`[agent] Balance: ${state.balance ?? 'unavailable'} ${CURRENCY} | dailyPnL=${state.dailyPnL}`);
+  } catch (error) {
+    console.error('[agent] Balance refresh failed:', error.message);
   }
 }
 
-// ── Odds refresh (per-market) ─────────────────────────────────────────────────
-async function refreshOdds(ms) {
-  if (!ms.eventId) return;
-
+async function refreshOdds() {
   try {
-    const payload = await fetchJson(`/v1/pm/events/${ms.eventId}?currency=NGN`);
+    const payload = await fetchJson(
+      `/v1/pm/events/${state.eventId}?currency=NGN`,
+    );
+
     const markets = payload?.markets ?? payload?.data?.markets ?? [];
-    const market  = markets.find(m => m.id === ms.marketId) ?? markets[0];
+    const market = markets.find(m => m.id === state.marketId) ?? markets[0];
 
     if (!market) {
-      console.log(`[${ms.symbol}:odds] No matching market in response`);
+      console.log('[odds] No matching market found in event response');
       return;
     }
 
     const yes = Number(market.outcome1Price ?? market.prices?.YES ?? market.prices?.yes);
-    const no  = Number(market.outcome2Price ?? market.prices?.NO  ?? market.prices?.no);
+    const no = Number(market.outcome2Price ?? market.prices?.NO ?? market.prices?.no);
 
-    if (Number.isFinite(yes) && yes > 0) ms.yesPrice = yes;
-    if (Number.isFinite(no)  && no  > 0) ms.noPrice  = no;
+    if (Number.isFinite(yes) && yes > 0) state.yesPrice = yes;
+    if (Number.isFinite(no) && no > 0) state.noPrice = no;
 
     if (yes === 0 && no === 0) {
-      // Window closed — clear state so shouldSkipEvaluation blocks this market.
-      // Do NOT call refreshEventContext here: that caused an endless loop firing
-      // every 30s. The per-market interval below handles recovery silently.
-      ms.yesPrice = null;
-      ms.noPrice  = null;
-      ms.eventId  = null;
-      ms.marketId = null;
-      console.log(`[${ms.symbol}:odds] Window closed — awaiting next window`);
+      console.log('[odds] Market window closed, refreshing event context...');
+      state.yesPrice = null;
+      state.noPrice = null;
+      try {
+        await refreshEventContext();
+      } catch (err) {
+        console.log('[odds] No new market window open yet, will retry in 30s');
+      }
       return;
     }
 
-    // Sync marketId from live response — corrects any bad value from event init (fixes SOL 404)
-    if (market.id) ms.marketId = market.id;
+    if (market.outcome1Id) {
+      state.outcome1Id = market.outcome1Id;
+      state.yesOutcomeId = market.outcome1Id;
+    }
+    if (market.outcome2Id) {
+      state.outcome2Id = market.outcome2Id;
+      state.noOutcomeId = market.outcome2Id;
+    }
 
-    if (market.outcome1Id) { ms.outcome1Id = market.outcome1Id; ms.yesOutcomeId = market.outcome1Id; }
-    if (market.outcome2Id) { ms.outcome2Id = market.outcome2Id; ms.noOutcomeId  = market.outcome2Id; }
-
-    console.log(`[${ms.symbol}:odds] YES=${ms.yesPrice} NO=${ms.noPrice}`);
+    console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice} | yesOutcomeId=${state.yesOutcomeId}`);
   } catch (err) {
-    console.error(`[${ms.symbol}:odds] refresh failed:`, err.message);
+    console.error('[odds] refresh failed:', err.message);
   }
 }
 
-// ── Evaluate and maybe trade (per-market, with concurrency lock) ──────────────
-async function evaluateAndMaybeTrade(ms) {
-  if (ms.isEvaluatingSignal) {
-    ms.pendingEvaluation = true;
+async function evaluateAndMaybeTrade() {
+  if (isEvaluatingSignal) {
+    pendingEvaluation = true;
     return;
   }
 
-  ms.isEvaluatingSignal = true;
+  isEvaluatingSignal = true;
 
   try {
     do {
-      ms.pendingEvaluation = false;
+      pendingEvaluation = false;
 
-      const skipReason = shouldSkipEvaluation(ms);
+      const skipReason = shouldSkipEvaluation();
       if (skipReason) {
-        console.log(`[${ms.symbol}:signal] skipped: ${skipReason}`);
+        console.log(`[signal] skipped: ${skipReason}`);
         continue;
       }
 
-      const effective = getEffectiveState(ms);
-      const signal = await generateSignal(effective);
+      const signal = await generateSignal(state);
 
       if (!signal.shouldTrade) {
-        console.log(`[${ms.symbol}:signal] no trade: ${signal.reason}`);
+        console.log(`[signal] no trade: ${signal.reason}`);
         continue;
       }
 
-      // Lock out further attempts for this window before async execution
-      ms.lastTradeAt = new Date().toISOString();
+      // Lock out further attempts for this market window immediately
+      // regardless of whether execution succeeds or fails
+      state.lastTradeAt = new Date().toISOString();
 
-      const result = await executeOrder(signal, effective);
+      const result = await executeOrder(signal, state);
 
       if (!result.success && result.reason?.includes('no liquidity')) {
-        console.log(`[${ms.symbol}:executor] No liquidity — skipping notification`);
+        console.log('[executor] No liquidity — skipping notification');
         continue;
       }
 
-      await sendNotification(signal, result, effective);
-    } while (ms.pendingEvaluation);
+      await sendNotification(signal, result, state);
+    } while (pendingEvaluation);
   } finally {
-    ms.isEvaluatingSignal = false;
+    isEvaluatingSignal = false;
   }
 }
 
-// ── Price tick ingestion ──────────────────────────────────────────────────────
-function addPriceTick(ms, tick) {
-  // Support Bayse WS format ({ price, timestamp }) and Binance miniTicker ({ c })
-  const price = Number(tick.price ?? tick.c ?? tick.lastPrice ?? tick.value);
+function addPriceTick(tick) {
+  const price = Number(tick.price ?? tick.lastPrice ?? tick.value);
   if (!Number.isFinite(price)) return;
 
-  const timestamp = tick.timestamp ?? new Date().toISOString();
+  const timestamp = tick.timestamp ?? tick.ts ?? new Date().toISOString();
 
-  ms.currentPrice = price;
+  state.btcPrice = price;
 
-  // Keep 1 hour of history
   const cutoff = Date.now() - 60 * 60 * 1000;
-  ms.priceHistory = ms.priceHistory.filter(
+  state.priceHistory = state.priceHistory.filter(
     t => new Date(t.timestamp).getTime() > cutoff,
   );
 
-  ms.priceHistory.push({ price, timestamp, volume: Number(tick.volume ?? 1) });
+  state.priceHistory.push({ price, timestamp, volume: Number(tick.volume ?? 1) });
 }
 
-// ── Reconnectable WebSocket factory ──────────────────────────────────────────
 function createReconnectableWs(name, url, handlers) {
   let socket = null;
   let attempts = 0;
@@ -380,33 +321,31 @@ function createReconnectableWs(name, url, handlers) {
     socket.on('open', async () => {
       attempts = 0;
       console.log(`[ws:${name}] connected`);
-      try { await handlers.onOpen(socket); } catch (err) {
-        console.error(`[ws:${name}] onOpen failed:`, err.message);
+      try {
+        await handlers.onOpen(socket);
+      } catch (error) {
+        console.error(`[ws:${name}] onOpen failed:`, error.message);
         socket.close();
       }
     });
 
     socket.on('message', async (raw) => {
-      // Bayse WS sends NDJSON (newline-delimited JSON) when multiple symbols
-      // are subscribed — each symbol's update is a separate JSON object on its
-      // own line within a single frame. Split and parse each line individually.
-      const lines = String(raw).split('\n').map(l => l.trim()).filter(Boolean);
-      for (const line of lines) {
-        try {
-          const message = JSON.parse(line);
-          await handlers.onMessage(message);
-        } catch (err) {
-          console.error(`[ws:${name}] message parse error:`, err.message);
-        }
+      try {
+        const message = JSON.parse(String(raw));
+        await handlers.onMessage(message);
+      } catch (error) {
+        console.error(`[ws:${name}] message handling error:`, error.message);
       }
     });
 
-    socket.on('error', (err) => console.error(`[ws:${name}] error:`, err.message));
+    socket.on('error', (error) => {
+      console.error(`[ws:${name}] error:`, error.message);
+    });
 
     socket.on('close', () => {
       attempts += 1;
       const delay = Math.min(WS_BACKOFF_START_MS * 2 ** (attempts - 1), WS_BACKOFF_MAX_MS);
-      console.log(`[ws:${name}] closed — reconnecting in ${delay}ms`);
+      console.log(`[ws:${name}] closed, reconnecting in ${delay}ms`);
       setTimeout(connect, delay);
     });
   };
@@ -414,125 +353,43 @@ function createReconnectableWs(name, url, handlers) {
   connect();
 }
 
-// ── Startup ───────────────────────────────────────────────────────────────────
-async function initAllMarkets() {
-  const results = await Promise.allSettled(
-    [...marketStates.values()].map(async (ms) => {
-      await refreshEventContext(ms);
-      await refreshOdds(ms);
-      console.log(`[${ms.symbol}] Initialized ✓`);
-    }),
-  );
-
-  for (const [i, result] of results.entries()) {
-    if (result.status === 'rejected') {
-      const sym = MARKETS[i]?.symbol ?? i;
-      console.error(`[${sym}] Init failed — will retry on next context refresh:`, result.reason?.message);
-    }
-  }
-}
-
 export async function startAgent() {
-  console.log('[agent] Starting multi-market engine — BTC / ETH / SOL / BNB (15min UP/DOWN)');
+  console.log('[agent] Starting Bayse Signal Engine agent loop');
 
+  await refreshEventContext();
   await refreshBalance();
-  await initAllMarkets();
+  await refreshOdds();
 
-  // ── Wallet-level intervals ────────────────────────────────────────────────
   setInterval(refreshBalance, BALANCE_REFRESH_MS);
+  setInterval(refreshOdds, ODDS_REFRESH_MS);
 
-  // ── Per-market smart interval — runs every 30s ───────────────────────────
-  // When in a window (eventId set): refreshes odds only.
-  // When between windows (eventId null): silently tries to find the new event.
-  // This single interval replaces two separate ones and eliminates the loop
-  // that previously fired refreshEventContext from inside refreshOdds.
-  for (const ms of marketStates.values()) {
-    setInterval(async () => {
-      try {
-        if (!ms.eventId) {
-          // Between windows — try to find the next one, stay silent on failure
-          await refreshEventContext(ms);
-          await refreshOdds(ms);
-        } else {
-          // In window — odds refresh only
-          await refreshOdds(ms);
-        }
-      } catch (err) {
-        // No open window yet — suppress log spam, retry next interval
-      }
-    }, ODDS_REFRESH_MS);
-  }
+  setInterval(async () => {
+    try {
+      await refreshEventContext();
+      await refreshOdds();
+    } catch (err) {
+      console.error('[agent] Event context refresh failed:', err.message);
+    }
+  }, MINUTES_BETWEEN_TRADES * 60 * 1000);
 
-  // ── Bayse WS — BTC, ETH, SOL price feed ─────────────────────────────────
-  // All three are available on the Bayse realtime feed (sourced from Binance).
-  // Incoming ticks are routed to the correct market state by priceSymbol.
-  const bayseSymbols = MARKETS
-    .filter(m => m.priceSymbol !== null)
-    .map(m => m.priceSymbol);  // ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
-
-  createReconnectableWs(
-    'bayse-prices',
-    'wss://socket.bayse.markets/ws/v1/realtime',
-    {
-      onOpen: async (socket) => {
-        socket.send(JSON.stringify({
-          type: 'subscribe',
-          channel: 'asset_prices',
-          symbols: bayseSymbols,
-        }));
-        console.log(`[ws:bayse-prices] Subscribed: ${bayseSymbols.join(', ')}`);
-      },
-      onMessage: async (message) => {
-        if (message.type !== 'asset_price') return;
-
-        const sym = message.data?.symbol;
-        if (!sym) return;
-
-        const ms = [...marketStates.values()].find(m => m.priceSymbol === sym);
-        if (!ms) return;
-
-        addPriceTick(ms, message.data ?? message);
-
-        if (ms.yesPrice != null) {
-          await evaluateAndMaybeTrade(ms);
-        }
-      },
+  createReconnectableWs('asset-prices', 'wss://socket.bayse.markets/ws/v1/realtime', {
+    onOpen: async (socket) => {
+      socket.send(JSON.stringify({
+        type: 'subscribe',
+        channel: 'asset_prices',
+        symbols: ['BTCUSDT'],
+      }));
     },
-  );
+    onMessage: async (message) => {
+      if (message.type !== 'asset_price') return;
 
-  // ── Binance WS — BNB price feed ──────────────────────────────────────────
-  // BNBUSDT is not available on the Bayse WS — connect directly to Binance.
-  // miniTicker fires every second with the last traded price (field: c).
-  const bnbState = marketStates.get('BNB');
-  if (bnbState) {
-    createReconnectableWs(
-      'binance-bnb',
-      'wss://data-stream.binance.vision/ws/bnbusdt@miniTicker',
-      {
-        onOpen: async () => {
-          console.log('[ws:binance-bnb] BNBUSDT miniTicker connected');
-        },
-        onMessage: async (message) => {
-          if (!message.c) return;
-          addPriceTick(bnbState, {
-            price: Number(message.c),
-            timestamp: new Date().toISOString(),
-          });
-          if (bnbState.yesPrice != null) {
-            await evaluateAndMaybeTrade(bnbState);
-          }
-        },
-      },
-    );
-  }
+      addPriceTick(message.data ?? message);
+
+      if (state.yesPrice != null) {
+        await evaluateAndMaybeTrade();
+      }
+    },
+  });
 }
 
-// ── Exports ───────────────────────────────────────────────────────────────────
-export { walletState, marketStates };
-
-// Legacy single-market state alias (BTC) — keeps any external consumers working
-export const state = {
-  get btcPrice() { return marketStates.get('BTC')?.currentPrice ?? null; },
-  get balance()  { return walletState.balance; },
-  get dailyPnL() { return walletState.dailyPnL; },
-};
+export { state };

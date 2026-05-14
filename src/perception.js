@@ -77,8 +77,8 @@ export async function fetchBalance() {
 
 // ── Binance mirror fallback chain ─────────────────────────────────────────────
 // data-api.binance.vision is the official market data mirror (no eligibility check).
-// api1–api4 are Binance's own regional load balancers — tried in order if the
-// primary mirror is unreachable.
+// api1–api4 are Binance's own regional load balancers — try them in order if the
+// primary mirror is unreachable from this Render node's geographic location.
 const BINANCE_PRICE_HOSTS = [
   'https://data-api.binance.vision',
   'https://api1.binance.com',
@@ -112,17 +112,10 @@ export async function fetchBTCPrice() {
   return Number.parseFloat(data?.price);
 }
 
-/**
- * Fetch 1-minute Binance klines for any symbol.
- * Used by signal.js for regime classification and indicator calculations.
- *
- * @param {string} symbol - Binance symbol e.g. 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'
- * @param {number} limit  - Number of candles to fetch (default 20, max 1000)
- */
-export async function fetchKlines(symbol = 'BTCUSDT', limit = 20) {
+export async function fetchBTCKlines(limit = 20) {
   const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : 20;
   const response = await tryBinanceFetch(
-    `/api/v3/klines?symbol=${symbol}&interval=1m&limit=${safeLimit}`,
+    `/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=${safeLimit}`,
   );
   const data = await response.json();
   if (!Array.isArray(data)) {
@@ -136,6 +129,3 @@ export async function fetchKlines(symbol = 'BTCUSDT', limit = 20) {
     volume: Number.parseFloat(kline?.[5]),
   }));
 }
-
-// Backward-compatible alias — existing callers of fetchBTCKlines still work.
-export const fetchBTCKlines = (limit) => fetchKlines('BTCUSDT', limit);

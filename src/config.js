@@ -14,47 +14,13 @@ export const ALPHA_MIN_STRENGTH = 0.1;
 export const ALPHA_EARLY_OVERRIDE_STRENGTH = 0.2;
 export const ALPHA_EARLY_MINUTE = 5;
 export const ALPHA_LATE_MINUTE = 12;
-export const MIN_HISTORY_POINTS = 20;
-export const REGIME_CANDLE_LIMIT = 100;
 
-/**
- * Active markets — all 15-min UP/DOWN on Bayse Markets.
- *
- * priceSymbol — symbol on Bayse WS /ws/v1/realtime (asset_prices channel).
- *               null = not available on Bayse WS; price fed via Binance WS instead.
- * klineSymbol — Binance symbol for klines (regime + indicator candles).
- * seriesSlug  — Bayse event series slug for fetching the current open event window.
- *               BTC slug is confirmed. ETH/SOL/BNB slugs are inferred from the same
- *               pattern — verify all four via GET /v1/pm/events/series on first boot
- *               and update any that differ.
- */
-export const MARKETS = [
-  {
-    name: 'BTC 15min',
-    symbol: 'BTC',
-    priceSymbol: 'BTCUSDT',   // Bayse WS realtime feed
-    klineSymbol: 'BTCUSDT',   // Binance klines for regime + indicators
-    seriesSlug: 'crypto-btc-15m',
-  },
-  {
-    name: 'ETH 15min',
-    symbol: 'ETH',
-    priceSymbol: 'ETHUSDT',   // Bayse WS realtime feed
-    klineSymbol: 'ETHUSDT',
-    seriesSlug: 'crypto-eth-15m',
-  },
-  {
-    name: 'SOL 15min',
-    symbol: 'SOL',
-    priceSymbol: 'SOLUSDT',   // Bayse WS realtime feed
-    klineSymbol: 'SOLUSDT',
-    seriesSlug: 'crypto-sol-15m',
-  },
-  {
-    name: 'BNB 15min',
-    symbol: 'BNB',
-    priceSymbol: null,         // Not on Bayse WS — uses Binance WS miniTicker
-    klineSymbol: 'BNBUSDT',
-    seriesSlug: 'crypto-bnb-15m',
-  },
-];
+// ✅ CHANGED: was 6 — 6 ticks is dangerously thin, agent fired on seconds of data.
+// 20 ticks ensures at least several minutes of WebSocket price history before
+// any evaluation runs. Binance candles are now the primary data source anyway.
+export const MIN_HISTORY_POINTS = 20;
+
+// ✅ NEW: How many Binance 1m candles to pull for regime classification
+// and indicator calculations (RSI needs 14+, MACD needs 35+, regime needs 30+).
+// 100 gives comfortable headroom for all three and covers ~1.5 hours of context.
+export const REGIME_CANDLE_LIMIT = 100;
