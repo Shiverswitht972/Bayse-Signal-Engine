@@ -61,11 +61,12 @@ function minutesUntilResolution() {
 }
 
 function shouldSkipEvaluation() {
-  // ✅ FIX 1: Tightened from 0.10/0.90 to 0.15/0.80
-  // When the market prices YES at 80%+ it has strong conviction backed by
-  // real liquidity and participant knowledge. Betting against it with a
-  // momentum model on 1m candles is a low-probability play — skip it.
-  if (state.yesPrice !== null && (state.yesPrice < 0.15 || state.yesPrice > 0.80)) {
+  // ✅ FIX: Tightened from 0.15/0.80 to 0.18/0.75.
+  // At YES=0.79 the old 0.80 guard let a trade through that full-ported
+  // into the wrong side of an extreme market. A 75% YES price represents
+  // 3:1 crowd conviction backed by real liquidity — our momentum model
+  // has no edge betting against that on 1m candles.
+  if (state.yesPrice !== null && (state.yesPrice < 0.18 || state.yesPrice > 0.75)) {
     return `Market too one-sided (yesPrice=${state.yesPrice?.toFixed(2)}) — skipping`;
   }
 
