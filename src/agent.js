@@ -4,6 +4,7 @@ import { generateSignal } from './signal.js';
 import { executeOrder } from './executor.js';
 import { sendNotification } from './notify.js';
 import { isInExpiryDeadZone } from './utils/expiryDeadZone.js';
+import { logTrade, updateOutcome, getPendingTrades } from './journal.js';
 import {
   BALANCE_REFRESH_MS,
   CURRENCY,
@@ -11,6 +12,7 @@ import {
   MARKET_END_BUFFER_MINUTES,
   MIN_HISTORY_POINTS,
   MINUTES_BETWEEN_TRADES,
+  TRADE_JOURNAL_ENABLED,
   WS_BACKOFF_MAX_MS,
   WS_BACKOFF_START_MS,
 } from './config.js';
@@ -18,38 +20,42 @@ import {
 const ODDS_REFRESH_MS = 30_000;
 
 const state = {
-  btcPrice: null,
-  priceHistory: [],
-  yesPrice: null,
-  noPrice: null,
-  yesOutcomeId: null,
-  noOutcomeId: null,
-  outcome1Id: null,
-  outcome2Id: null,
-  eventId: null,
-  marketId: null,
-  eventTitle: null,
-  resolvesAt: null,
-  openingPrice: null,
-  balance: null,
-  lastTradeAt: null,
-  dailyPnL: 0,
-  dailyPnLResetDate: null,
-  dayStartBalance: null,
+  btcPrice:            null,
+  priceHistory:        [],
+  yesPrice:            null,
+  noPrice:             null,
+  yesOutcomeId:        null,
+  noOutcomeId:         null,
+  outcome1Id:          null,
+  outcome2Id:          null,
+  eventId:             null,
+  marketId:            null,
+  eventTitle:          null,
+  resolvesAt:          null,
+  openingPrice:        null,
+  balance:             null,
+  lastTradeAt:         null,
+  dailyPnL:            0,
+  dailyPnLResetDate:   null,
+  dayStartBalance:     null,
+  // ── New fields ──────────────────────────────────────────────────────────────
+  lastRegime:          null,   // last known regime string, used by journal
+  lastTradeBalancePre: null,   // balance immediately before the last trade
+  lastTradeId:         null,   // journal id of the last trade, for outcome tracking
 };
 
 export { getCandles } from './candles.js';
 
 let isEvaluatingSignal = false;
-let pendingEvaluation = false;
-let previousEventId = null;
+let pendingEvaluation  = false;
+let previousEventId    = null;
 
 function resetDailyPnlIfNeeded() {
   const utcDate = new Date().toISOString().slice(0, 10);
   if (state.dailyPnLResetDate !== utcDate) {
-    state.dailyPnL = 0;
+    state.dailyPnL          = 0;
     state.dailyPnLResetDate = utcDate;
-    state.dayStartBalance = state.balance;
+    state.dayStartBalance   = state.balance;
     console.log(`[agent] Daily PnL reset for UTC date ${utcDate}`);
   }
 }
@@ -61,11 +67,6 @@ function minutesUntilResolution() {
 }
 
 function shouldSkipEvaluation() {
-  // ✅ FIX: Tightened from 0.15/0.80 to 0.18/0.75.
-  // At YES=0.79 the old 0.80 guard let a trade through that full-ported
-  // into the wrong side of an extreme market. A 75% YES price represents
-  // 3:1 crowd conviction backed by real liquidity — our momentum model
-  // has no edge betting against that on 1m candles.
   if (state.yesPrice !== null && (state.yesPrice < 0.18 || state.yesPrice > 0.75)) {
     return `Market too one-sided (yesPrice=${state.yesPrice?.toFixed(2)}) — skipping`;
   }
@@ -99,7 +100,7 @@ function shouldSkipEvaluation() {
       state.btcPrice,
       state.openingPrice,
     )) {
-      const secsLeft = Math.round((new Date(state.resolvesAt).getTime() - Date.now()) / 1000);
+      const secsLeft   = Math.round((new Date(state.resolvesAt).getTime() - Date.now()) / 1000);
       const priceDelta = Math.abs(state.btcPrice - state.openingPrice).toFixed(2);
       console.warn(`[DEAD ZONE] Skipped — ${secsLeft}s to expiry, price $${priceDelta} from line`);
       return 'Expiry dead zone — too close to line near resolution';
@@ -128,7 +129,7 @@ async function fetchJson(path, init = {}) {
 
 function parseOpenBtcEvent(payload) {
   const events = payload?.data ?? payload?.events ?? payload ?? [];
-  const list = Array.isArray(events) ? events : [];
+  const list   = Array.isArray(events) ? events : [];
 
   const btcEvent =
     list.find((event) => {
@@ -140,32 +141,67 @@ function parseOpenBtcEvent(payload) {
       return title.includes('BITCOIN') && (title.includes('UP') || title.includes('DOWN'));
     });
 
-  if (!btcEvent) {
-    throw new Error('No open BTC UP/DOWN event found');
-  }
+  if (!btcEvent) throw new Error('No open BTC UP/DOWN event found');
 
   const market = btcEvent.market ?? btcEvent.markets?.[0] ?? {};
 
   return {
-    eventId: btcEvent.id ?? btcEvent.eventId,
-    marketId: market.id ?? market.marketId,
+    eventId:    btcEvent.id ?? btcEvent.eventId,
+    marketId:   market.id ?? market.marketId,
     eventTitle: btcEvent.title ?? btcEvent.name ?? 'BTC market',
     resolvesAt: btcEvent.resolvesAt ?? btcEvent.endTime ?? btcEvent.closeTime ?? null,
   };
 }
 
+/**
+ * When a new market window is detected, attempt to resolve outcomes for any
+ * trades that were placed in the previous window.
+ *
+ * Resolution logic: compare current balance against the pre-trade balance.
+ * If balance is higher → WIN; lower → LOSS. This is approximate but correct
+ * in the vast majority of cases where only one trade fired per window.
+ */
+function resolveOutcomesFromBalanceChange() {
+  if (!TRADE_JOURNAL_ENABLED) return;
+
+  const pending = getPendingTrades();
+  if (pending.length === 0) return;
+
+  const currentBalance = state.balance;
+  if (currentBalance == null) return;
+
+  for (const trade of pending) {
+    const balanceBefore = trade.balanceBefore;
+    if (balanceBefore == null) continue;
+
+    const diff = currentBalance - balanceBefore;
+    let outcome;
+
+    if (Math.abs(diff) < 10) {
+      outcome = 'PUSH'; // tiny difference, likely timing artefact
+    } else {
+      outcome = diff > 0 ? 'WIN' : 'LOSS';
+    }
+
+    updateOutcome(trade.id, { outcome, pnl: Number(diff.toFixed(2)) });
+  }
+}
+
 async function refreshEventContext() {
-  const payload = await fetchJson('/v1/pm/events?category=crypto&status=open');
+  const payload      = await fetchJson('/v1/pm/events?category=crypto&status=open');
   const eventContext = parseOpenBtcEvent(payload);
 
   if (eventContext.eventId !== previousEventId) {
     state.openingPrice = state.btcPrice;
-    previousEventId = eventContext.eventId;
+    previousEventId    = eventContext.eventId;
     console.log(`[agent] New market window detected — opening price: $${state.openingPrice}`);
+
+    // Resolve outcomes from the previous window
+    resolveOutcomesFromBalanceChange();
   }
 
-  state.eventId = eventContext.eventId;
-  state.marketId = eventContext.marketId;
+  state.eventId    = eventContext.eventId;
+  state.marketId   = eventContext.marketId;
   state.eventTitle = eventContext.eventTitle;
   state.resolvesAt = eventContext.resolvesAt;
 
@@ -179,10 +215,10 @@ async function refreshEventContext() {
 
 async function refreshBalance() {
   try {
-    const data = await fetchJson('/v1/wallet/assets');
-    const assets = data?.assets ?? [];
+    const data     = await fetchJson('/v1/wallet/assets');
+    const assets   = data?.assets ?? [];
     const ngnAsset = assets.find(a => a.symbol === 'NGN');
-    const balance = ngnAsset ? Number(ngnAsset.availableBalance) : null;
+    const balance  = ngnAsset ? Number(ngnAsset.availableBalance) : null;
 
     if (Number.isFinite(balance)) {
       state.balance = balance;
@@ -198,7 +234,9 @@ async function refreshBalance() {
       state.dailyPnL = Number((state.balance - state.dayStartBalance).toFixed(2));
     }
 
-    console.log(`[agent] Balance: ${state.balance ?? 'unavailable'} ${CURRENCY} | dailyPnL=${state.dailyPnL}`);
+    console.log(
+      `[agent] Balance: ${state.balance ?? 'unavailable'} ${CURRENCY} | dailyPnL=${state.dailyPnL}`,
+    );
   } catch (error) {
     console.error('[agent] Balance refresh failed:', error.message);
   }
@@ -206,12 +244,9 @@ async function refreshBalance() {
 
 async function refreshOdds() {
   try {
-    const payload = await fetchJson(
-      `/v1/pm/events/${state.eventId}?currency=NGN`,
-    );
-
+    const payload = await fetchJson(`/v1/pm/events/${state.eventId}?currency=NGN`);
     const markets = payload?.markets ?? payload?.data?.markets ?? [];
-    const market = markets.find(m => m.id === state.marketId) ?? markets[0];
+    const market  = markets.find(m => m.id === state.marketId) ?? markets[0];
 
     if (!market) {
       console.log('[odds] No matching market found in event response');
@@ -219,15 +254,15 @@ async function refreshOdds() {
     }
 
     const yes = Number(market.outcome1Price ?? market.prices?.YES ?? market.prices?.yes);
-    const no = Number(market.outcome2Price ?? market.prices?.NO ?? market.prices?.no);
+    const no  = Number(market.outcome2Price ?? market.prices?.NO  ?? market.prices?.no);
 
     if (Number.isFinite(yes) && yes > 0) state.yesPrice = yes;
-    if (Number.isFinite(no) && no > 0) state.noPrice = no;
+    if (Number.isFinite(no)  && no  > 0) state.noPrice  = no;
 
     if (yes === 0 && no === 0) {
       console.log('[odds] Market window closed, refreshing event context...');
       state.yesPrice = null;
-      state.noPrice = null;
+      state.noPrice  = null;
       try {
         await refreshEventContext();
       } catch (err) {
@@ -237,12 +272,12 @@ async function refreshOdds() {
     }
 
     if (market.outcome1Id) {
-      state.outcome1Id = market.outcome1Id;
+      state.outcome1Id  = market.outcome1Id;
       state.yesOutcomeId = market.outcome1Id;
     }
     if (market.outcome2Id) {
-      state.outcome2Id = market.outcome2Id;
-      state.noOutcomeId = market.outcome2Id;
+      state.outcome2Id  = market.outcome2Id;
+      state.noOutcomeId  = market.outcome2Id;
     }
 
     console.log(`[odds] YES=${state.yesPrice} NO=${state.noPrice} | yesOutcomeId=${state.yesOutcomeId}`);
@@ -271,20 +306,36 @@ async function evaluateAndMaybeTrade() {
 
       const signal = await generateSignal(state);
 
+      // Track last known regime for journal fallback
+      if (signal.regime) {
+        state.lastRegime = signal.regime;
+      }
+
       if (!signal.shouldTrade) {
         console.log(`[signal] no trade: ${signal.reason}`);
         continue;
       }
 
-      // Lock out further attempts for this market window immediately
-      // regardless of whether execution succeeds or fails
-      state.lastTradeAt = new Date().toISOString();
+      // Lock out further attempts immediately, before execution
+      state.lastTradeAt         = new Date().toISOString();
+      state.lastTradeBalancePre = state.balance;
 
       const result = await executeOrder(signal, state);
 
       if (!result.success && result.reason?.includes('no liquidity')) {
         console.log('[executor] No liquidity — skipping notification');
         continue;
+      }
+
+      // Log to journal
+      if (TRADE_JOURNAL_ENABLED && result.success) {
+        state.lastTradeId = logTrade({
+          signal,
+          state,
+          result,
+          session:     signal.session,
+          signalScore: signal.signalScore,
+        });
       }
 
       await sendNotification(signal, result, state);
@@ -302,7 +353,7 @@ function addPriceTick(tick) {
 
   state.btcPrice = price;
 
-  const cutoff = Date.now() - 60 * 60 * 1000;
+  const cutoff    = Date.now() - 60 * 60 * 1000;
   state.priceHistory = state.priceHistory.filter(
     t => new Date(t.timestamp).getTime() > cutoff,
   );
@@ -311,7 +362,7 @@ function addPriceTick(tick) {
 }
 
 function createReconnectableWs(name, url, handlers) {
-  let socket = null;
+  let socket   = null;
   let attempts = 0;
 
   const connect = async () => {
@@ -376,7 +427,7 @@ export async function startAgent() {
   createReconnectableWs('asset-prices', 'wss://socket.bayse.markets/ws/v1/realtime', {
     onOpen: async (socket) => {
       socket.send(JSON.stringify({
-        type: 'subscribe',
+        type:    'subscribe',
         channel: 'asset_prices',
         symbols: ['BTCUSDT'],
       }));
