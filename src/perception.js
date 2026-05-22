@@ -112,10 +112,42 @@ export async function fetchBTCPrice() {
   return Number.parseFloat(data?.price);
 }
 
-export async function fetchBTCKlines(limit = 20) {
-  const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : 20;
+/**
+ * Fetch 1-minute OHLCV candles from Binance.
+ * Primary data source for RSI, MACD, Bollinger Bands, and regime classification.
+ *
+ * @param {number} limit — number of candles (default 100, max 1000)
+ */
+export async function fetchBTCKlines(limit = 100) {
+  const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : 100;
   const response = await tryBinanceFetch(
     `/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=${safeLimit}`,
+  );
+  const data = await response.json();
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  return data.map((kline) => ({
+    open:   Number.parseFloat(kline?.[1]),
+    high:   Number.parseFloat(kline?.[2]),
+    low:    Number.parseFloat(kline?.[3]),
+    close:  Number.parseFloat(kline?.[4]),
+    volume: Number.parseFloat(kline?.[5]),
+  }));
+}
+
+/**
+ * Fetch 15-minute OHLCV candles from Binance.
+ * Used for higher-timeframe (HTF) bias check in signal.js.
+ * EMA(9) vs EMA(21) on 15m gives the macro trend direction before
+ * firing on any 1m signal — prevents trading against the larger move.
+ *
+ * @param {number} limit — number of candles (default 50 = ~12.5 hours)
+ */
+export async function fetchBTCKlines15m(limit = 50) {
+  const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : 50;
+  const response = await tryBinanceFetch(
+    `/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=${safeLimit}`,
   );
   const data = await response.json();
   if (!Array.isArray(data)) {
