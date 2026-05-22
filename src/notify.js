@@ -1,5 +1,5 @@
 export async function sendNotification(signal, result, state) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
   if (!token || !chatId) {
@@ -7,40 +7,61 @@ export async function sendNotification(signal, result, state) {
     return;
   }
 
-  const status = result.success ? 'filled' : 'failed';
+  const status  = result.success ? '✅ filled' : '❌ failed';
   const orderId = result.orderId ?? 'n/a';
 
+  // Score bar: filled squares for score, empty for remainder
+  const score    = signal.signalScore ?? 0;
+  const scoreBar = '█'.repeat(Math.round(score)) + '░'.repeat(10 - Math.round(score));
+
+  // Regime label with ADX
+  const regimeLabel = signal.regime
+    ? `${signal.regime}${signal.adx != null ? ` (ADX ${signal.adx.toFixed(1)})` : ''}`
+    : 'n/a';
+
+  // HTF bias label
+  const htfLabel = signal.htfBias
+    ? `15m ${signal.htfBias}`
+    : 'n/a';
+
+  // Bollinger label
+  const bbLabel = signal.bollingerPctB != null
+    ? `%B=${signal.bollingerPctB.toFixed(3)} ${signal.bollingerPctB > 0.8 ? '(upper)' : signal.bollingerPctB < 0.2 ? '(lower)' : '(mid)'}`
+    : 'n/a';
+
   const text = [
-    'Bayse Signal Engine',
-    '───────────────────',
+    '⚡ Bayse Signal Engine',
+    '───────────────────────',
     `Market : ${state.eventTitle ?? 'BTC 15-min UP/DOWN'}`,
     `YES    : ${state.yesPrice ?? 'n/a'}  NO: ${state.noPrice ?? 'n/a'}`,
     `BTC    : $${state.btcPrice ?? 'n/a'}`,
     `D5m    : ${(signal.delta5m ?? 0).toFixed(3)}%`,
     '',
-    'Analysis',
+    '📊 Analysis',
+    `Score  : ${score}/10  ${scoreBar}`,
+    `Session: ${signal.session ?? 'n/a'}`,
+    `Regime : ${regimeLabel}`,
+    `HTF    : ${htfLabel}`,
+    `BB     : ${bbLabel}`,
     `P(up)  : ${Number(signal.pUp ?? 0).toFixed(4)}`,
     `Edge   : ${Number(signal.netEdge ?? 0).toFixed(4)}`,
     `Conf   : ${Number(signal.confidence ?? 0).toFixed(4)}`,
     `Signal : BUY ${signal.direction ?? 'NONE'}`,
     `Source : ${signal.decision?.source ?? 'base'}`,
     '',
-    'Execution',
-    `Stake  : N${Number(signal.stake ?? 0).toFixed(2)}`,
+    '💸 Execution',
+    `Stake  : ₦${Number(signal.stake ?? 0).toFixed(2)}`,
     `Status : ${status}`,
     `Order  : ${orderId}`,
     '',
-    `Daily PnL : N${Number(state.dailyPnL ?? 0).toFixed(2)}`,
-    `Balance   : N${Number(state.balance ?? 0).toFixed(2)}`,
+    `Daily PnL : ₦${Number(state.dailyPnL ?? 0).toFixed(2)}`,
+    `Balance   : ₦${Number(state.balance ?? 0).toFixed(2)}`,
   ].join('\n');
 
   const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: 'POST',
+    method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-    }),
+    body:    JSON.stringify({ chat_id: chatId, text }),
   });
 
   if (!response.ok) {
