@@ -208,10 +208,7 @@ export async function generateSignal(state) {
       };
     }
 
-    // ✅ FIX 2: Block when MACD contradicts the EMA trend direction
-    // This is exactly what happened in the trade that blew the port —
-    // regime called TRENDING DOWN but MACD was bullish (macd > signal).
-    // When indicators disagree like that, the trend read is unreliable.
+    // Block when MACD contradicts the EMA trend direction
     if (regime.regime === 'TRENDING' && regime.contradicted) {
       console.warn(`[regime] TRENDING ${regime.direction} blocked — MACD contradicts (${regime.macdDirection})`);
       return {
@@ -308,18 +305,47 @@ export async function generateSignal(state) {
   let threshold = yesPrice >= 0.4 && yesPrice <= 0.6 ? 0.65 : 0.55;
   if (Math.abs(delta5m) > 0.5) threshold -= 0.05;
 
-  const absEdge = Math.abs(directionalEdge);
-  if (absEdge >= 0.25) threshold = Math.min(threshold, 0.35);
-  else if (absEdge >= 0.15) threshold = Math.min(threshold, 0.45);
-  else if (absEdge >= 0.10) threshold -= 0.05;
+  // ✅ FIX: Threshold direction fix for extreme markets.
+  // Previously, a large edge (absEdge >= 0.25) would DROP threshold to 0.35
+  // regardless of market conditions. When yesPrice=0.79 and the model has
+  // high "edge" on NO, that edge is our model being strongly contrarian
+  // against 79% crowd consensus — a reason to RAISE the bar, not lower it.
+  // Threshold reduction only applies when the market is balanced (35-65%).
+  // Outside that range, we raise threshold to require stronger conviction.
+  const marketIsExtreme = yesPrice > 0.65 || yesPrice < 0.35;
+  if (!marketIsExtreme) {
+    const absEdge = Math.abs(directionalEdge);
+    if (absEdge >= 0.25) threshold = Math.min(threshold, 0.35);
+    else if (absEdge >= 0.15) threshold = Math.min(threshold, 0.45);
+    else if (absEdge >= 0.10) threshold -= 0.05;
+  } else {
+    // Extreme market: require meaningfully higher conviction to bet against the crowd.
+    // Cap at 0.80 so it doesn't become unreachable in all cases.
+    threshold = Math.min(threshold + 0.10, 0.80);
+  }
 
   console.log(
     `[signal:detail] yes_edge=${netYesEdge === -Infinity ? 'no-liq' : netYesEdge.toFixed(3)} no_edge=${netNoEdge === -Infinity ? 'no-liq' : netNoEdge.toFixed(3)} direction=${direction} odds=${oddsDivergence.toFixed(3)} momentum=${momentumScore.toFixed(3)} volume=${volumeScore.toFixed(3)} composite=${compositeScore.toFixed(3)} threshold=${threshold.toFixed(3)} pUp=${pUp.toFixed(3)} yesPrice=${yesPrice}`,
   );
 
+  // ✅ FIX: Kelly multiplier cap + confidence-margin stake scaling.
+  //
+  // Kelly blow-up: when betting the low-probability side (e.g. NO at pricedSide=0.21),
+  // the Kelly formula produces multipliers near 2x. At KELLY_FRACTION=0.5 that is
+  // effectively full-porting the balance. Cap at 1.5 to prevent this.
+  //
+  // Confidence scaling: barely-over-threshold trades should never get full Kelly.
+  // Scale stake linearly from 0 at threshold to full Kelly at threshold + 0.08.
+  // This means a composite of 0.375 vs threshold 0.65 would get near-zero stake
+  // even if Kelly is large — protecting capital on marginal signals.
   const pricedSide = direction === 'YES' ? yesPrice : 1 - yesPrice;
-  const kelly      = pricedSide > 0 ? directionalEdge / pricedSide : 0;
-  const rawStake   = kelly * state.balance * KELLY_FRACTION;
+  const kellyRaw   = pricedSide > 0 ? directionalEdge / pricedSide : 0;
+  const kelly      = Math.min(kellyRaw, 1.5);
+
+  const confidenceMargin = Math.max(0, compositeScore - threshold);
+  const confidenceScale  = Math.min(1, confidenceMargin / 0.08);
+  const rawStake         = kelly * state.balance * KELLY_FRACTION * confidenceScale;
+
   const maxAffordableStake     = Math.min(MAX_STAKE_NGN, state.balance);
   const hasMinimumBalanceForStake = maxAffordableStake >= MIN_STAKE_NGN;
   const stake = hasMinimumBalanceForStake
@@ -354,5 +380,32 @@ export async function generateSignal(state) {
 
   console.log(`[alpha] active=${alphaSignal.active} dir=${alphaSignal.direction} strength=${alphaSignal.strength?.toFixed(4) ?? 'n/a'}`);
 
-  return combineSignals(baseSignal, alphaSignal, state);
+  const finalSignal = combineSignals(baseSignal, alphaSignal, state);
+
+  // ✅ FIX: Alpha hard gate on base-only marginal trades.
+  // combineSignals passes base signals through unchecked when alpha is inactive —
+  // alpha can boost or agree but it currently cannot veto. This gate closes that gap.
+  // If alpha didn't fire AND the trade is purely base-driven AND the composite is
+  // within 0.08 of threshold, block the trade. Alpha inactivity + thin margin is
+  // the exact combination that produced the full-port loss in the logged trade.
+  if (
+    finalSignal.shouldTrade &&
+    !alphaSignal.active &&
+    finalSignal.decision?.source === 'base'
+  ) {
+    const marginAboveThreshold = compositeScore - threshold;
+    if (marginAboveThreshold < 0.08) {
+      console.warn(
+        `[alpha] Hard gate blocked base-only trade — margin ${marginAboveThreshold.toFixed(3)} < 0.08 required without alpha confirmation`,
+      );
+      return {
+        ...finalSignal,
+        shouldTrade: false,
+        stake: 0,
+        reason: `Alpha inactive — base-only signal rejected (margin ${marginAboveThreshold.toFixed(3)} < 0.08 required without alpha confirmation)`,
+      };
+    }
+  }
+
+  return finalSignal;
 }
