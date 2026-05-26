@@ -1,11 +1,12 @@
 import WebSocket from 'ws';
 import { BASE_URL, buildReadHeaders } from './auth.js';
 import { generateSignal } from './signal.js';
-import { executeOrder } from './executor.js';
+import { executeOrder, closePosition } from './executor.js';
 import { sendNotification } from './notify.js';
 import { isInExpiryDeadZone } from './utils/expiryDeadZone.js';
 import { logTrade, updateOutcome, getPendingTrades } from './journal.js';
-import { startForecaster, getLatestForecast, isForecastFresh } from './forecaster.js';
+import { startForecaster, getLatestForecast, isForecastFresh, triggerImmediateForecast } from './forecaster.js';
+import { evaluateExit } from './monitor.js';
 import {
   BALANCE_REFRESH_MS,
   CURRENCY,
@@ -44,13 +45,15 @@ const state = {
   lastTradeBalancePre: null,   // balance immediately before the last trade
   lastTradeId:         null,   // journal id of the last trade, for outcome tracking
   windowOpenTime:      null,   // ISO timestamp when the current market window opened
+  openPosition:        null,   // { direction, outcomeId, entryYesPrice, entryNoPrice, entryTime, stake, shares }
 };
 
 export { getCandles } from './candles.js';
 
-let isEvaluatingSignal = false;
-let pendingEvaluation  = false;
-let previousEventId    = null;
+let isEvaluatingSignal  = false;
+let pendingEvaluation   = false;
+let previousEventId     = null;
+let monitorTickCount    = 0;   // throttle: evaluate position every N ticks
 
 function resetDailyPnlIfNeeded() {
   const utcDate = new Date().toISOString().slice(0, 10);
@@ -70,7 +73,12 @@ function minutesUntilResolution() {
 
 function shouldSkipEvaluation() {
   if (state.yesPrice !== null && (state.yesPrice < 0.18 || state.yesPrice > 0.75)) {
-    // Allow evaluation when a fresh, confident forecast disagrees with the crowd pricing.
+    // Fire an immediate forecast using the one-sided yesPrice as crowd-signal context.
+    // This runs async (fire-and-forget) so it's ready before the next window opens.
+    // The crowd's over-commitment is the most useful input for next-window direction.
+    triggerImmediateForecast(state.yesPrice).catch(() => {});
+
+    // Allow evaluation if a fresh, confident forecast disagrees with the crowd pricing.
     // A market at 0.78 YES forecasted DOWN = contrarian edge on the NO side.
     // A market at 0.15 YES forecasted UP   = contrarian edge on the YES side.
     if (isForecastFresh(5 * 60_000)) {
@@ -219,6 +227,17 @@ async function refreshEventContext() {
     state.openingPrice   = state.btcPrice;
     state.windowOpenTime = new Date().toISOString();
     previousEventId      = eventContext.eventId;
+
+    // Previous window has resolved — clear the position tracker
+    if (state.openPosition) {
+      console.log(
+        `[agent] Window resolved — clearing open position ` +
+        `(direction=${state.openPosition.direction}, was monitoring)`,
+      );
+      state.openPosition = null;
+      monitorTickCount   = 0;
+    }
+
     console.log(
       `[agent] New market window detected — opening price: $${state.openingPrice} ` +
       `windowOpenTime: ${state.windowOpenTime}`,
@@ -356,6 +375,24 @@ async function evaluateAndMaybeTrade() {
         continue;
       }
 
+      // Track the open position for mid-trade monitoring
+      if (result.success) {
+        state.openPosition = {
+          direction:     signal.direction,
+          outcomeId:     signal.outcomeId,
+          entryYesPrice: state.yesPrice,
+          entryNoPrice:  state.noPrice,
+          entryTime:     new Date().toISOString(),
+          stake:         signal.stake,
+          shares:        result.shares ?? null,
+        };
+        monitorTickCount = 0;
+        console.log(
+          `[monitor] Position opened — direction=${signal.direction} ` +
+          `entryYesPrice=${state.yesPrice} shares=${result.shares ?? 'unknown'}`,
+        );
+      }
+
       // Log to journal
       if (TRADE_JOURNAL_ENABLED && result.success) {
         state.lastTradeId = logTrade({
@@ -374,6 +411,64 @@ async function evaluateAndMaybeTrade() {
   }
 }
 
+/**
+ * Evaluates the open position and exits if monitor says so.
+ * Called on every 15th price tick while a position is open.
+ * Fire-and-forget from addPriceTick — errors are caught internally.
+ */
+async function evaluateOpenPosition() {
+  if (!state.openPosition) return;
+
+  const assessment = evaluateExit(state);
+
+  console.log(
+    `[monitor] ${assessment.action} — ${assessment.reason} ` +
+    `(adverse=${assessment.adversePct.toFixed(1)}%)`,
+  );
+
+  if (assessment.action !== 'EXIT') return;
+
+  // ── Attempt to close position via SELL order ────────────────────────────────
+  const pos    = state.openPosition;
+  const result = await closePosition(pos, state);
+
+  if (result.success) {
+    console.log(
+      `[monitor] Position CLOSED — orderId=${result.orderId} ` +
+      `exitYesPrice=${result.exitYesPrice} proceeds=${result.proceeds}`,
+    );
+    state.openPosition = null;
+    monitorTickCount   = 0;
+  } else {
+    // SELL not supported or failed — log and alert via Telegram, don't crash
+    console.warn(`[monitor] SELL failed (${result.reason}) — sending alert, holding position`);
+  }
+
+  // Send Telegram alert regardless of whether the SELL succeeded
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (token && chatId) {
+    const exitStatus = result.success ? '✅ Position SOLD' : `⚠️ EXIT SIGNAL — SELL failed (${result.reason})`;
+    const text = [
+      `🔴 Monitor Exit — ${pos.direction} position`,
+      `───────────────────────`,
+      `Reason   : ${assessment.reason}`,
+      `Adverse  : ${assessment.adversePct.toFixed(1)}%`,
+      `Entry    : yesPrice=${pos.entryYesPrice?.toFixed(3)}`,
+      `Current  : yesPrice=${state.yesPrice?.toFixed(3)}`,
+      `BTC      : $${state.btcPrice}`,
+      `Status   : ${exitStatus}`,
+      result.success ? `Proceeds : ${result.proceeds ?? 'n/a'}` : `Manual action may be required`,
+    ].join('\n');
+
+    fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ chat_id: chatId, text }),
+    }).catch(() => {});
+  }
+}
+
 function addPriceTick(tick) {
   const price = Number(tick.price ?? tick.lastPrice ?? tick.value);
   if (!Number.isFinite(price)) return;
@@ -382,12 +477,22 @@ function addPriceTick(tick) {
 
   state.btcPrice = price;
 
-  const cutoff    = Date.now() - 60 * 60 * 1000;
+  const cutoff = Date.now() - 60 * 60 * 1000;
   state.priceHistory = state.priceHistory.filter(
     t => new Date(t.timestamp).getTime() > cutoff,
   );
 
   state.priceHistory.push({ price, timestamp, volume: Number(tick.volume ?? 1) });
+
+  // Throttled position monitoring — evaluate every 15 ticks (~15–30 seconds)
+  if (state.openPosition) {
+    monitorTickCount++;
+    if (monitorTickCount % 15 === 0) {
+      evaluateOpenPosition().catch(err =>
+        console.error('[monitor] Evaluation error:', err.message),
+      );
+    }
+  }
 }
 
 function createReconnectableWs(name, url, handlers) {
