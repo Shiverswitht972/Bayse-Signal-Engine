@@ -261,6 +261,7 @@ function computeSignalScore({
   delta5m,
   regime,
   session,
+  forecastBias,
 }) {
   let score  = 0;
   const isUp = direction === 'YES';
@@ -332,6 +333,16 @@ function computeSignalScore({
   // 7. Active trading session bonus (0–1 pt)
   if (session.name === 'LONDON' || session.name === 'NEW_YORK') score += 1;
 
+  // 8. Forecast alignment (0–2 pts)
+  // Background forecast agreeing with this direction adds strong independent confirmation.
+  // Disagreement adds 0 pts — the edge calc already favours the opposite side in that case.
+  if (forecastBias && forecastBias.direction !== 'NEUTRAL') {
+    const forecastIsUp = forecastBias.direction === 'UP';
+    if (forecastIsUp === isUp && forecastBias.confidence > 0.55) {
+      score += forecastBias.confidence > 0.75 ? 2 : 1;
+    }
+  }
+
   return Math.min(Math.round(score * 10) / 10, 10); // cap at 10, keep 1 decimal
 }
 
@@ -370,12 +381,28 @@ async function fetchQuoteFeeRatio(eventId, marketId, outcomeId) {
 }
 
 // ── Main signal generator ─────────────────────────────────────────────────────
-export async function generateSignal(state) {
+export async function generateSignal(state, forecastBias = null) {
   const yesPrice = Number(state.yesPrice);
 
   // ── Session ────────────────────────────────────────────────────────────────
   const session = getCurrentSession();
   console.log(`[signal] Session: ${session.name} (threshold multiplier: ${session.multiplier}x)`);
+
+  // ── Early window detection ─────────────────────────────────────────────────
+  // Within the first 90 seconds of a new window, a fresh forecast enables faster
+  // entry with a reduced score requirement — instead of waiting for indicators
+  // to accumulate, the pre-computed forecast provides the directional thesis.
+  const secondsSinceWindowOpen = state.windowOpenTime
+    ? (Date.now() - new Date(state.windowOpenTime).getTime()) / 1000
+    : Number.POSITIVE_INFINITY;
+  const isEarlyWindow = secondsSinceWindowOpen <= 90;
+
+  if (isEarlyWindow) {
+    console.log(
+      `[signal] Early window — ${secondsSinceWindowOpen.toFixed(0)}s since open` +
+      (forecastBias ? ` | forecast: ${forecastBias.direction} (conf=${forecastBias.confidence.toFixed(2)})` : ' | no forecast'),
+    );
+  }
 
   // ── Fetch Binance candles (1m + 15m) ──────────────────────────────────────
   let binanceCandles = null;
@@ -616,6 +643,7 @@ export async function generateSignal(state) {
     delta5m,
     regime,
     session,
+    forecastBias,
   });
 
   console.log(
@@ -632,10 +660,23 @@ export async function generateSignal(state) {
   );
 
   // ── Signal score gate ──────────────────────────────────────────────────────
-  if (compositeScore > threshold && directionalEdge > 0 && signalScore < SIGNAL_SCORE_MIN) {
+  // Early window + confident forecast = lower score requirement.
+  // Rationale: the forecast has already done analysis before the window opened;
+  // waiting for a full score in the first 90 seconds means missing the entry.
+  // Floor is 3 to prevent any signal from firing without at least basic confluence.
+  const effectiveScoreMin = (
+    isEarlyWindow &&
+    forecastBias &&
+    forecastBias.direction !== 'NEUTRAL' &&
+    forecastBias.confidence > 0.55
+  ) ? Math.max(SIGNAL_SCORE_MIN - 2, 3) : SIGNAL_SCORE_MIN;
+
+  if (compositeScore > threshold && directionalEdge > 0 && signalScore < effectiveScoreMin) {
+    const earlyNote = effectiveScoreMin < SIGNAL_SCORE_MIN
+      ? ` (early window — reduced from ${SIGNAL_SCORE_MIN})`
+      : '';
     console.warn(
-      `[score] Signal score gate blocked trade — ` +
-      `score=${signalScore} < required=${SIGNAL_SCORE_MIN}`,
+      `[score] Signal score gate blocked trade — score=${signalScore} < required=${effectiveScoreMin}${earlyNote}`,
     );
     return {
       shouldTrade: false,
@@ -647,7 +688,7 @@ export async function generateSignal(state) {
       regime:      regime?.regime ?? 'UNKNOWN',
       signalScore,
       session:     session.name,
-      reason:      `Signal score ${signalScore} below minimum ${SIGNAL_SCORE_MIN} — not enough confirming factors`,
+      reason:      `Signal score ${signalScore} below minimum ${effectiveScoreMin}${earlyNote} — not enough confirming factors`,
       delta5m,
     };
   }
@@ -684,6 +725,9 @@ export async function generateSignal(state) {
     adx:        regime?.adx ?? null,
     htfBias:    htfBias?.direction ?? null,
     bollingerPctB: bollingerData?.pctB ?? null,
+    forecastDirection:  forecastBias?.direction  ?? null,
+    forecastConfidence: forecastBias?.confidence ?? null,
+    isEarlyWindow,
     reason: shouldTrade
       ? `Score ${signalScore}/10 — composite crossed dynamic threshold (${threshold.toFixed(3)})`
       : hasMinimumBalanceForStake
