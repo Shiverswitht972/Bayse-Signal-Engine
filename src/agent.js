@@ -5,6 +5,7 @@ import { executeOrder } from './executor.js';
 import { sendNotification } from './notify.js';
 import { isInExpiryDeadZone } from './utils/expiryDeadZone.js';
 import { logTrade, updateOutcome, getPendingTrades } from './journal.js';
+import { startForecaster, getLatestForecast, isForecastFresh } from './forecaster.js';
 import {
   BALANCE_REFRESH_MS,
   CURRENCY,
@@ -42,6 +43,7 @@ const state = {
   lastRegime:          null,   // last known regime string, used by journal
   lastTradeBalancePre: null,   // balance immediately before the last trade
   lastTradeId:         null,   // journal id of the last trade, for outcome tracking
+  windowOpenTime:      null,   // ISO timestamp when the current market window opened
 };
 
 export { getCandles } from './candles.js';
@@ -68,7 +70,29 @@ function minutesUntilResolution() {
 
 function shouldSkipEvaluation() {
   if (state.yesPrice !== null && (state.yesPrice < 0.18 || state.yesPrice > 0.75)) {
-    return `Market too one-sided (yesPrice=${state.yesPrice?.toFixed(2)}) — skipping`;
+    // Allow evaluation when a fresh, confident forecast disagrees with the crowd pricing.
+    // A market at 0.78 YES forecasted DOWN = contrarian edge on the NO side.
+    // A market at 0.15 YES forecasted UP   = contrarian edge on the YES side.
+    if (isForecastFresh(5 * 60_000)) {
+      const forecast   = getLatestForecast();
+      const marketBias = state.yesPrice > 0.75 ? 'UP' : 'DOWN';
+      if (
+        forecast.direction !== 'NEUTRAL' &&
+        forecast.direction !== marketBias &&
+        forecast.confidence > 0.55
+      ) {
+        console.log(
+          `[agent] One-sided market (yesPrice=${state.yesPrice.toFixed(2)}) but ` +
+          `forecast DISAGREES (${forecast.direction} conf=${forecast.confidence.toFixed(2)}) ` +
+          `— allowing contrarian evaluation`,
+        );
+        // fall through — do not return a skip reason
+      } else {
+        return `Market too one-sided (yesPrice=${state.yesPrice?.toFixed(2)}) — skipping`;
+      }
+    } else {
+      return `Market too one-sided (yesPrice=${state.yesPrice?.toFixed(2)}) — skipping`;
+    }
   }
 
   if (state.priceHistory.length < MIN_HISTORY_POINTS) {
@@ -192,9 +216,13 @@ async function refreshEventContext() {
   const eventContext = parseOpenBtcEvent(payload);
 
   if (eventContext.eventId !== previousEventId) {
-    state.openingPrice = state.btcPrice;
-    previousEventId    = eventContext.eventId;
-    console.log(`[agent] New market window detected — opening price: $${state.openingPrice}`);
+    state.openingPrice   = state.btcPrice;
+    state.windowOpenTime = new Date().toISOString();
+    previousEventId      = eventContext.eventId;
+    console.log(
+      `[agent] New market window detected — opening price: $${state.openingPrice} ` +
+      `windowOpenTime: ${state.windowOpenTime}`,
+    );
 
     // Resolve outcomes from the previous window
     resolveOutcomesFromBalanceChange();
@@ -304,7 +332,8 @@ async function evaluateAndMaybeTrade() {
         continue;
       }
 
-      const signal = await generateSignal(state);
+      const forecastBias = isForecastFresh(5 * 60_000) ? getLatestForecast() : null;
+      const signal = await generateSignal(state, forecastBias);
 
       // Track last known regime for journal fallback
       if (signal.regime) {
@@ -408,6 +437,7 @@ function createReconnectableWs(name, url, handlers) {
 export async function startAgent() {
   console.log('[agent] Starting Bayse Signal Engine agent loop');
 
+  await startForecaster();
   await refreshEventContext();
   await refreshBalance();
   await refreshOdds();
