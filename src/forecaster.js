@@ -33,7 +33,7 @@ const FORECAST_INTERVAL_MS   = 3 * 60_000;  // re-compute every 3 minutes
 const VOLUME_SPIKE_THRESHOLD  = 3.0;         // 3× rolling average = spike
 const VOLUME_SPIKE_LOOKBACK   = 20;          // candles for rolling average
 const SCORE_THRESHOLD         = 3;           // |score| must exceed this for directional call
-const MAX_SCORE               = 10;          // denominator for confidence normalisation
+const MAX_SCORE               = 12;          // 6 factors × max ±2 each
 const SPIKE_TTL_MS            = 10 * 60_000; // clear spike record after 10 minutes
 
 // ── Shared forecast state ─────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ const forecastState = {
   updatedAt:        null,   // ISO string of last successful computation
   volumeSpike:      null,   // { direction, magnitude, pricePct, detectedAt } | null
   spikeDetectedAt:  null,   // ISO string, used for TTL
+  triggeredBy:      null,   // 'scheduled' | 'one-sided-market (yesPrice=X)'
 };
 
 // ── Math helpers (self-contained, no imports from signal.js) ──────────────────
@@ -267,8 +268,128 @@ function scoreEMATrend(candles15m) {
   return { score: 0, label: 'EMA(15m): aligned (no separation)' };
 }
 
+// ── Factor 6: Crowd signal — one-sided market analysis (−2 to +2) ────────────
+//
+// This is the core of next-window forecasting from a one-sided market.
+// When yesPrice > 0.75 or < 0.25, the crowd has already committed heavily
+// to a direction. The question for the NEXT window is:
+//   - Is that commitment backed by real momentum? → continuation
+//   - Or is momentum fading/reversing despite the crowd? → reversal
+//
+// Reversal indicators (crowd over-extended):
+//   UP crowd + RSI > 70 + momentum decelerating  → DOWN reversal next window
+//   UP crowd + RSI contradicts (<50 despite UP)  → DOWN reversal next window
+//   DOWN crowd + RSI < 30 + momentum recovering  → UP reversal next window
+//   DOWN crowd + RSI contradicts (>50 despite DWN)→ UP reversal next window
+//
+// Continuation indicators (crowd backed by genuine momentum):
+//   UP crowd + RSI > 60 + volume spike + ROC accelerating → UP continuation
+//   DOWN crowd + RSI < 40 + volume spike + ROC accelerating → DOWN continuation
+//
+// Returns score = 0 when yesPrice is balanced (0.25–0.75) — not applicable.
+function scoreCrowdSignal(yesPrice, candles1m, candles15m) {
+  if (
+    yesPrice === null ||
+    yesPrice === undefined ||
+    (yesPrice >= 0.25 && yesPrice <= 0.75)
+  ) {
+    return { score: 0, label: 'Crowd: balanced market — not applicable' };
+  }
+
+  const crowdIsUp     = yesPrice > 0.75;
+  const crowdStrength = crowdIsUp ? yesPrice : (1 - yesPrice); // 0.75 → 1.00
+
+  const closes1m  = candles1m.map(c => c.close);
+  const closes15m = candles15m.map(c => c.close);
+
+  // RSI from 15m candles — primary exhaustion indicator
+  const rsiVal = _rsi(closes15m, 14);
+
+  // Recent 1m momentum — is price still moving in the crowd's direction?
+  const n          = closes1m.length;
+  const rocRecent  = n >= 4 && closes1m[n - 4] > 0
+    ? (closes1m[n - 1] - closes1m[n - 4]) / closes1m[n - 4]
+    : 0;
+  const momentumMatchesCrowd = crowdIsUp ? rocRecent > 0 : rocRecent < 0;
+
+  // Volume conviction — is the crowd backed by real participation?
+  const recent   = candles1m.slice(-(VOLUME_SPIKE_LOOKBACK + 1));
+  const avgVol   = recent.slice(0, -1).reduce((s, c) => s + c.volume, 0) / Math.max(recent.length - 1, 1);
+  const lastVol  = recent.at(-1)?.volume ?? 0;
+  const volRatio = avgVol > 0 ? lastVol / avgVol : 1;
+  const hasVolumeConviction = volRatio >= 2.0;
+
+  let score = 0;
+  let label = '';
+
+  if (crowdIsUp) {
+    // ── UP crowd scenarios ───────────────────────────────────────────────────
+    if (rsiVal !== null) {
+      if (rsiVal > 70 && !momentumMatchesCrowd) {
+        // Classic overbought exhaustion: crowd all-in UP but price already turning
+        score = -2;
+        label = `Crowd: UP over-extended (rsi=${rsiVal.toFixed(1)}, mom reversing) → reversal DOWN next window`;
+      } else if (rsiVal > 70 && momentumMatchesCrowd && hasVolumeConviction) {
+        // Genuinely strong: RSI high, price still climbing, volume backing it
+        score = 1;
+        label = `Crowd: UP crowd genuine (rsi=${rsiVal.toFixed(1)}, vol=${volRatio.toFixed(1)}×) → continuation UP`;
+      } else if (rsiVal > 70 && momentumMatchesCrowd && !hasVolumeConviction) {
+        // Price still up but volume fading = weak conviction
+        score = -1;
+        label = `Crowd: UP crowd thinning (rsi=${rsiVal.toFixed(1)}, vol fading) → weak continuation, reversal risk`;
+      } else if (rsiVal < 50) {
+        // RSI below 50 but crowd saying UP: disconnect = crowd likely wrong
+        score = -2;
+        label = `Crowd: UP crowd but RSI disagrees (rsi=${rsiVal.toFixed(1)}) → reversal DOWN likely next window`;
+      } else if (rsiVal >= 50 && rsiVal <= 70) {
+        // Mid-range RSI with UP crowd: lean on momentum direction
+        score = momentumMatchesCrowd ? 1 : -1;
+        label = `Crowd: UP crowd, RSI mid-range (rsi=${rsiVal.toFixed(1)}) — momentum ${momentumMatchesCrowd ? 'confirming UP' : 'diverging → lean DOWN'}`;
+      } else {
+        score = 0;
+        label = `Crowd: UP crowd — RSI unavailable`;
+      }
+    }
+  } else {
+    // ── DOWN crowd scenarios ─────────────────────────────────────────────────
+    if (rsiVal !== null) {
+      if (rsiVal < 30 && !momentumMatchesCrowd) {
+        // Classic oversold exhaustion: crowd all-in DOWN but price recovering
+        score = 2;
+        label = `Crowd: DOWN over-extended (rsi=${rsiVal.toFixed(1)}, mom recovering) → reversal UP next window`;
+      } else if (rsiVal < 30 && momentumMatchesCrowd && hasVolumeConviction) {
+        // Genuine sell-off: RSI crushed, price still falling, volume backing it
+        score = -1;
+        label = `Crowd: DOWN crowd genuine (rsi=${rsiVal.toFixed(1)}, vol=${volRatio.toFixed(1)}×) → continuation DOWN`;
+      } else if (rsiVal < 30 && momentumMatchesCrowd && !hasVolumeConviction) {
+        // Price still down but volume drying up = selling exhausting
+        score = 1;
+        label = `Crowd: DOWN crowd thinning (rsi=${rsiVal.toFixed(1)}, vol fading) → reversal UP setting up`;
+      } else if (rsiVal > 50) {
+        // RSI above 50 but crowd saying DOWN: disconnect = crowd likely wrong
+        score = 2;
+        label = `Crowd: DOWN crowd but RSI disagrees (rsi=${rsiVal.toFixed(1)}) → reversal UP likely next window`;
+      } else if (rsiVal >= 30 && rsiVal <= 50) {
+        score = momentumMatchesCrowd ? -1 : 1;
+        label = `Crowd: DOWN crowd, RSI mid-range (rsi=${rsiVal.toFixed(1)}) — momentum ${momentumMatchesCrowd ? 'confirming DOWN' : 'diverging → lean UP'}`;
+      } else {
+        score = 0;
+        label = `Crowd: DOWN crowd — RSI unavailable`;
+      }
+    }
+  }
+
+  // Amplify by 1 when crowd is extreme (>80%) — more extreme = more meaningful signal
+  if (score !== 0 && crowdStrength > 0.80) {
+    score = Math.sign(score) * Math.min(Math.abs(score) + 1, 2);
+    label += ` [extreme conviction ${(crowdStrength * 100).toFixed(0)}%]`;
+  }
+
+  return { score, label };
+}
+
 // ── Main forecast computation ─────────────────────────────────────────────────
-async function computeForecast() {
+async function computeForecast(yesPrice = null) {
   let candles15m, candles1m;
 
   try {
@@ -286,14 +407,15 @@ async function computeForecast() {
     return;
   }
 
-  const macdResult = scoreMACDCrossover(candles15m);
-  const rsiResult  = scoreRSIDivergence(candles15m);
-  const volResult  = scoreVolumeVelocity(candles1m);
-  const rocResult  = scoreROCAcceleration(candles1m);
-  const emaResult  = scoreEMATrend(candles15m);
+  const macdResult  = scoreMACDCrossover(candles15m);
+  const rsiResult   = scoreRSIDivergence(candles15m);
+  const volResult   = scoreVolumeVelocity(candles1m);
+  const rocResult   = scoreROCAcceleration(candles1m);
+  const emaResult   = scoreEMATrend(candles15m);
+  const crowdResult = scoreCrowdSignal(yesPrice, candles1m, candles15m);
 
   const rawScore = macdResult.score + rsiResult.score + volResult.score
-                 + rocResult.score  + emaResult.score;
+                 + rocResult.score  + emaResult.score + crowdResult.score;
   const absScore = Math.abs(rawScore);
 
   const direction = rawScore >  SCORE_THRESHOLD ? 'UP'
@@ -328,12 +450,16 @@ async function computeForecast() {
     volResult.label,
     rocResult.label,
     emaResult.label,
+    crowdResult.label,
   ];
-  forecastState.updatedAt = new Date().toISOString();
+  forecastState.updatedAt   = new Date().toISOString();
+  forecastState.triggeredBy = yesPrice !== null
+    ? `one-sided-market (yesPrice=${yesPrice.toFixed(2)})`
+    : 'scheduled';
 
   console.log(
     `[forecaster] direction=${direction} confidence=${confidence.toFixed(3)} ` +
-    `score=${rawScore}/${MAX_SCORE}\n` +
+    `score=${rawScore}/${MAX_SCORE} trigger=${forecastState.triggeredBy}\n` +
     forecastState.basis.map(b => `  • ${b}`).join('\n'),
   );
 }
@@ -355,6 +481,27 @@ export function getLatestForecast() {
 export function isForecastFresh(maxAgeMs = 5 * 60_000) {
   if (!forecastState.updatedAt) return false;
   return Date.now() - new Date(forecastState.updatedAt).getTime() < maxAgeMs;
+}
+
+/**
+ * Triggers an immediate forecast computation using the current one-sided market
+ * yesPrice as an additional analytical input (Factor 6: Crowd Signal).
+ *
+ * Call this fire-and-forget from agent.js when a one-sided market is detected.
+ * By the time the next window opens, the forecast is ready with crowd context baked in.
+ *
+ * @param {number} yesPrice — current market yesPrice (e.g. 0.81)
+ */
+export async function triggerImmediateForecast(yesPrice) {
+  console.log(
+    `[forecaster] ⚡ Immediate trigger — yesPrice=${yesPrice.toFixed(2)} ` +
+    `— pre-computing next window direction`,
+  );
+  try {
+    await computeForecast(yesPrice);
+  } catch (err) {
+    console.error(`[forecaster] Immediate forecast failed: ${err.message}`);
+  }
 }
 
 /**
