@@ -182,7 +182,7 @@ strength:  separation,
 /**
 
 - Composite momentum score using Binance candles.
-- Prefers Binance if ≥35 candles available; falls back to internal candles.
+- Prefers Binance if >=35 candles available; falls back to internal candles.
   */
   function computeMomentum(priceHistory, internalCandles, binanceCandles) {
   const candles = (binanceCandles && binanceCandles.length >= 35)
@@ -246,7 +246,7 @@ return clamp(trend * directional, -1, 1);
 /**
 
 - Counts how many independent factors confirm the trade.
-- Each factor contributes 0–2 points. Score ≥ SIGNAL_SCORE_MIN required to trade.
+- Each factor contributes 0–2 points. Score >= SIGNAL_SCORE_MIN required to trade.
 - 
 - Factors and max contribution:
 - Regime alignment    2 pts
@@ -683,10 +683,10 @@ console.log(
 //
 // ADX tiers (both regime + HTF against trade):
 //   ADX > 50 → hard block — dominant trend, contra-trade is disqualified
-//   ADX > 35 → require signal score ≥ 9
-//   ADX > 20 → require signal score ≥ 8
+//   ADX > 35 → require signal score >= 9
+//   ADX > 20 → require signal score >= 8
 // Only one of regime / HTF against trade:
-//   → require signal score ≥ 8 regardless of ADX
+//   → require signal score >= 8 regardless of ADX
 {
 const tradeIsUp        = direction === ‘YES’;
 const regimeTrending   = regime?.regime === ‘TRENDING’;
@@ -751,14 +751,14 @@ if (regimeAgainst || htfAgainst) {
       regime:      regime?.regime ?? 'UNKNOWN',
       signalScore,
       session:     session.name,
-      reason:      `Contra-trend score floor — ${who} opposes ${direction} trade. score=${signalScore} needs ≥${contraScoreFloor}`,
+      reason:      `Contra-trend score floor — ${who} opposes ${direction} trade. score=${signalScore} needs >=${contraScoreFloor}`,
       delta5m,
     };
   }
 
   // Passes — log that this is a contra-trend trade that cleared the bar
   console.log(
-    `[contra] Contra-trend trade cleared — score=${signalScore} ≥ floor ` +
+    `[contra] Contra-trend trade cleared — score=${signalScore} >= floor ` +
     `${bothAgainst && adx > 35 ? 9 : 8}. Proceeding.`,
   );
 }
